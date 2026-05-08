@@ -198,191 +198,191 @@ jobs:
           name: linux-assets-${{ matrix.platform }}
           path: ${{ github.workspace }}/dist/carveracontroller-community-*.appimage
           retention-days: 2
-
-  build-pypi-artifacts:
-    name: build-python
-    runs-on: ubuntu-24.04
-    permissions:
-      id-token: write
-    defaults:
-      run:
-        shell: bash
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # all history is required for the dynamic versioning plugin
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: 3.12
-
-    - name: Install poetry and dependencies
-      uses: ./.github/actions/bootstrap-poetry
-      with:
-        os: linux
-
-    - name: Install gettext
-      run: sudo apt-get install -y gettext
-
-    - name: Build release
-      run: |
-        if [[ $GITHUB_REF == refs/tags/* ]]; then
-          VERSION=$GITHUB_REF_NAME
-        else
-          VERSION=$(date +'%Y.%m.%d')
-        fi
-        poetry run python scripts/build.py --os pypi --version "$VERSION"
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: pypi-assets
-        path: ${{ github.workspace }}/dist/*.whl
-        retention-days: 2
-
-    - name: Publish package to PyPI
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: pypa/gh-action-pypi-publish@release/v1
-
-  build-android-artifacts:
-    name: build-android
-    runs-on: ubuntu-22.04
-    defaults:
-      run:
-        shell: bash
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Cache Buildozer global directory
-      uses: actions/cache@v4
-      with:
-        path: ~/.buildozer
-        key: ${{ runner.os }}-buildozer-global
-        restore-keys: |
-          ${{ runner.os }}-buildozer-global
-
-    - name: Cache Buildozer directory in app
-      uses: actions/cache@v4
-      with:
-        path: .buildozer
-        key: ${{ runner.os }}-buildozer-app
-        restore-keys: |
-          ${{ runner.os }}-buildozer-app
-
-    - name: Cache Android SDK
-      uses: actions/cache@v4
-      with:
-        path: ~/.buildozer/android/platform/android-sdk
-        key: ${{ runner.os }}-android-sdk
-        restore-keys: |
-          ${{ runner.os }}-android-sdk
-
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v5
-      with:
-        python-version: 3.12
-
-    - name: Install poetry and dependencies
-      uses: ./.github/actions/bootstrap-poetry
-      with:
-        os: linux
-
-    - name: Install Linux prerequisites
-      run: poetry run ./scripts/install_linux_prereqs.sh
-
-    # Set up Java 17 required by Gradle
-    - name: Setup Java 17 required by Gradle
-      uses: actions/setup-java@v3
-      with:
-        distribution: 'temurin'  # or 'zulu', 'liberica', etc.
-        java-version: '17'
-
-    - name: Install prereqs
-      run: |
-        poetry run ./scripts/install_android_prereqs.sh
-
-    - name: Build release
-      run: |
-        if [[ $GITHUB_REF == refs/tags/* ]]; then
-          VERSION=$GITHUB_REF_NAME
-        else
-          VERSION=$(date +'%Y.%m.%d')
-        fi
-        xvfb-run poetry run python scripts/build.py --os android --version "$VERSION" --automation
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: android-assets
-        path: ${{ github.workspace }}/dist/carveracontroller-community-*.apk
-        retention-days: 2
-
-  build-docker-images:
-    name: build-docker-images
-    needs: [build-linux-artifacts]
-    runs-on: ${{ matrix.image }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: x64
-            image: ubuntu-24.04
-          - platform: arm64
-            image: ubuntu-24.04-arm
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Linux AppImage artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-assets-${{ matrix.platform }}
-          path: ./artifacts/
-
-      - name: Copy AppImage to Docker build context
-        run: |
-          mkdir -p assets/packaging/Docker/artifacts/
-          cp ./artifacts/*.appimage assets/packaging/Docker/artifacts/
-
-      # TODO: Add support for more platforms with QEMU
-      # https://github.com/docker/setup-qemu-action
-      #- name: Set up QEMU
-      #  uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/carvera-controller-${{ matrix.platform }}
-          tags: |
-            type=ref,event=tag
-            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'develop') }}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: assets/packaging/Docker
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/${{ matrix.platform == 'x64' && 'amd64' || matrix.platform }}
+#
+#  build-pypi-artifacts:
+#    name: build-python
+#    runs-on: ubuntu-24.04
+#    permissions:
+#      id-token: write
+#    defaults:
+#      run:
+#        shell: bash
+#    steps:
+#    - uses: actions/checkout@v4
+#      with:
+#        fetch-depth: 0  # all history is required for the dynamic versioning plugin
+#
+#    - name: Set up Python 3.12
+#      uses: actions/setup-python@v5
+#      with:
+#        python-version: 3.12
+#
+#    - name: Install poetry and dependencies
+#      uses: ./.github/actions/bootstrap-poetry
+#      with:
+#        os: linux
+#
+#    - name: Install gettext
+#      run: sudo apt-get install -y gettext
+#
+#    - name: Build release
+#      run: |
+#        if [[ $GITHUB_REF == refs/tags/* ]]; then
+#          VERSION=$GITHUB_REF_NAME
+#        else
+#          VERSION=$(date +'%Y.%m.%d')
+#        fi
+#        poetry run python scripts/build.py --os pypi --version "$VERSION"
+#
+#    - name: Upload artifact
+#      uses: actions/upload-artifact@v4
+#      with:
+#        name: pypi-assets
+#        path: ${{ github.workspace }}/dist/*.whl
+#        retention-days: 2
+#
+#    - name: Publish package to PyPI
+#      if: startsWith(github.ref, 'refs/tags/')
+#      uses: pypa/gh-action-pypi-publish@release/v1
+#
+#  build-android-artifacts:
+#    name: build-android
+#    runs-on: ubuntu-22.04
+#    defaults:
+#      run:
+#        shell: bash
+#    steps:
+#    - uses: actions/checkout@v4
+#
+#    - name: Cache Buildozer global directory
+#      uses: actions/cache@v4
+#      with:
+#        path: ~/.buildozer
+#        key: ${{ runner.os }}-buildozer-global
+#        restore-keys: |
+#          ${{ runner.os }}-buildozer-global
+#
+#    - name: Cache Buildozer directory in app
+#      uses: actions/cache@v4
+#      with:
+#        path: .buildozer
+#        key: ${{ runner.os }}-buildozer-app
+#        restore-keys: |
+#          ${{ runner.os }}-buildozer-app
+#
+#    - name: Cache Android SDK
+#      uses: actions/cache@v4
+#      with:
+#        path: ~/.buildozer/android/platform/android-sdk
+#        key: ${{ runner.os }}-android-sdk
+#        restore-keys: |
+#          ${{ runner.os }}-android-sdk
+#
+#    - name: Set up Python 3.12
+#      uses: actions/setup-python@v5
+#      with:
+#        python-version: 3.12
+#
+#    - name: Install poetry and dependencies
+#      uses: ./.github/actions/bootstrap-poetry
+#      with:
+#        os: linux
+#
+#    - name: Install Linux prerequisites
+#      run: poetry run ./scripts/install_linux_prereqs.sh
+#
+#    # Set up Java 17 required by Gradle
+#    - name: Setup Java 17 required by Gradle
+#      uses: actions/setup-java@v3
+#      with:
+#        distribution: 'temurin'  # or 'zulu', 'liberica', etc.
+#        java-version: '17'
+#
+#    - name: Install prereqs
+#      run: |
+#        poetry run ./scripts/install_android_prereqs.sh
+#
+#    - name: Build release
+#      run: |
+#        if [[ $GITHUB_REF == refs/tags/* ]]; then
+#          VERSION=$GITHUB_REF_NAME
+#        else
+#          VERSION=$(date +'%Y.%m.%d')
+#        fi
+#        xvfb-run poetry run python scripts/build.py --os android --version "$VERSION" --automation
+#
+#    - name: Upload artifact
+#      uses: actions/upload-artifact@v4
+#      with:
+#        name: android-assets
+#        path: ${{ github.workspace }}/dist/carveracontroller-community-*.apk
+#        retention-days: 2
+#
+#  build-docker-images:
+#    name: build-docker-images
+#    needs: [build-linux-artifacts]
+#    runs-on: ${{ matrix.image }}
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        include:
+#          - platform: x64
+#            image: ubuntu-24.04
+#          - platform: arm64
+#            image: ubuntu-24.04-arm
+#    permissions:
+#      contents: read
+#      packages: write
+#    steps:
+#      - uses: actions/checkout@v4
+#
+#      - name: Download Linux AppImage artifacts
+#        uses: actions/download-artifact@v4
+#        with:
+#          name: linux-assets-${{ matrix.platform }}
+#          path: ./artifacts/
+#
+#      - name: Copy AppImage to Docker build context
+#        run: |
+#          mkdir -p assets/packaging/Docker/artifacts/
+#          cp ./artifacts/*.appimage assets/packaging/Docker/artifacts/
+#
+#      # TODO: Add support for more platforms with QEMU
+#      # https://github.com/docker/setup-qemu-action
+#      #- name: Set up QEMU
+#      #  uses: docker/setup-qemu-action@v3
+#
+#      - name: Set up Docker Buildx
+#        uses: docker/setup-buildx-action@v3
+#
+#      - name: Log in to GitHub Container Registry
+#        uses: docker/login-action@v3
+#        with:
+#          registry: ghcr.io
+#          username: ${{ github.actor }}
+#          password: ${{ secrets.GITHUB_TOKEN }}
+#
+#      - name: Extract metadata
+#        id: meta
+#        uses: docker/metadata-action@v5
+#        with:
+#          images: ghcr.io/${{ github.repository_owner }}/carvera-controller-${{ matrix.platform }}
+#          tags: |
+#            type=ref,event=tag
+#            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'develop') }}
+#            type=raw,value=latest,enable={{is_default_branch}}
+#
+#      - name: Build and push Docker image
+#        uses: docker/build-push-action@v6
+#        with:
+#          context: assets/packaging/Docker
+#          push: true
+#          tags: ${{ steps.meta.outputs.tags }}
+#          labels: ${{ steps.meta.outputs.labels }}
+#          platforms: linux/${{ matrix.platform == 'x64' && 'amd64' || matrix.platform }}
 
   publish-release:
-    needs: [ build-windows-artifacts, build-macos-artifacts, build-linux-artifacts, build-pypi-artifacts ]
+    needs: [ build-windows-artifacts, build-macos-artifacts, build-linux-artifacts ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -427,27 +427,27 @@ jobs:
           body_path: ${{ startsWith(github.ref, 'refs/tags/') && 'CHANGELOG.md' || 'dev-CHANGELOG.md' }} 
           prerelease: ${{ startsWith(github.ref, 'refs/tags/') && 'false' || 'true' }}
 
-  publish-android-release:
-    needs: [ build-android-artifacts, publish-release ]  # depends on publish-release to delete previous release/tags
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:  # Skip downloading docker images
-          pattern: '*-assets*'
-      
-      - name: Generate dev release notes (dev builds only)
-        if: startsWith(github.ref, 'refs/heads/develop')
-        run: python3 ./scripts/dev_release_notes.py
-
-      - name: Publish Android release
-        uses: softprops/action-gh-release@v2.2.2
-        with:
-          files: android-assets/carveracontroller-community-*.apk
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-          body_path: ${{ startsWith(github.ref, 'refs/tags/') && 'CHANGELOG.md' || 'dev-CHANGELOG.md' }} 
-          prerelease: ${{ startsWith(github.ref, 'refs/tags/') && 'false' || 'true' }} 
+#  publish-android-release:
+#    needs: [ build-android-artifacts, publish-release ]  # depends on publish-release to delete previous release/tags
+#    runs-on: ubuntu-latest
+#    permissions:
+#      contents: write
+#    steps:
+#      - uses: actions/checkout@v4
+#
+#      - name: Download artifacts
+#        uses: actions/download-artifact@v4
+#        with:  # Skip downloading docker images
+#          pattern: '*-assets*'
+#      
+#      - name: Generate dev release notes (dev builds only)
+#        if: startsWith(github.ref, 'refs/heads/develop')
+#        run: python3 ./scripts/dev_release_notes.py
+#
+#      - name: Publish Android release
+#        uses: softprops/action-gh-release@v2.2.2
+#        with:
+#          files: android-assets/carveracontroller-community-*.apk
+#          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
+#          body_path: ${{ startsWith(github.ref, 'refs/tags/') && 'CHANGELOG.md' || 'dev-CHANGELOG.md' }} 
+#          prerelease: ${{ startsWith(github.ref, 'refs/tags/') && 'false' || 'true' }} 
