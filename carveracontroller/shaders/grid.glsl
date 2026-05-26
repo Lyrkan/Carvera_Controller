@@ -23,10 +23,16 @@ void main()
 }
 
 ---fragment
-$HEADER$
 #ifdef GL_ES
-    #extension GL_OES_standard_derivatives : enable
+    #ifdef GL_OES_standard_derivatives
+        #extension GL_OES_standard_derivatives : enable
+        #define GRID_HAS_FWIDTH 1
+    #endif
+#else
+    #define GRID_HAS_FWIDTH 1
 #endif
+
+$HEADER$
 
 varying vec2 vs_coords;
 
@@ -66,9 +72,14 @@ void main()
 
     float line_thickness = subcell_size * 0.01;
 
+#ifdef GRID_HAS_FWIDTH
     // Cap derivative-based AA so zoomed-out lines do not merge into solid black.
     vec2 d = min(fwidth(vs_coords), vec2(subcell_size * 0.12));
     vec2 adj = 0.5 * (line_thickness + d);
+#else
+    // Fallback for GLES2 devices without OES_standard_derivatives.
+    vec2 adj = vec2(line_thickness * 0.5);
+#endif
 
     float on_axis_y = 1.0 - step(adj.x, abs(vs_coords.x));
     float on_axis_x = 1.0 - step(adj.y, abs(vs_coords.y));
