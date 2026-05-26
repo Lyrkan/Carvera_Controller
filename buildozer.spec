@@ -38,7 +38,7 @@ version = 0.0.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy==2.3.1,pyserial==3.5,pyquicklz==1.4.1,filetype==1.2.0,android
+requirements = python3,cython==3.0.12,kivy==2.3.1,pyserial==3.5,pyquicklz==1.4.1,filetype==1.2.0,android
 
 # (str) Custom source folders for requirements
 # Sets custom source for any requirements with recipes
@@ -330,8 +330,8 @@ android.allow_backup = True
 p4a.branch = develop
 
 # (str) python-for-android specific commit to use, defaults to HEAD, must be within p4a.branch
-# Commits after 6b66944a2f51e0c848c7ac51e04a771324067ecc break the build
-p4a.commit = c02cf781a0d3d232eb4ffbeaf580cc82cf2bd65f
+# develop @ 2026-05-25; includes python-for-android #3301 (setuptools.build_meta / PYTHONPATH fix)
+p4a.commit = 4174efe23883907abfa6ae805332dc4db745f888
 
 # (str) python-for-android git clone directory (if empty, it will be automatically cloned from github)
 #p4a.source_dir =
