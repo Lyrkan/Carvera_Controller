@@ -3,6 +3,8 @@
 #:import digitize_v carveracontroller.Utils.digitize_v
 #:import tr carveracontroller.__main__.tr
 #:import play_progress_bar carveracontroller.ui.PlayProgressBar
+#:import GcodeColorSchemePanel carveracontroller.ui.GcodeColorSchemePanel.GcodeColorSchemePanel
+#:include ui/GcodeColorSchemePanel.kv
 #:include addons/tooltips/Tooltips.kv
 #:include addons/probing/ProbingPopup.kv
 
@@ -4132,6 +4134,7 @@
                                                         root.send_cmd()
                         FloatBox:
                             id: float_layout
+                            color_scheme_panel: color_scheme_panel
                             tool_bar: tool_bar
                             t1: t1
                             t2: t2
@@ -4146,9 +4149,12 @@
                                 id: gcode_viewer_container
                                 pos: float_layout.pos
                                 orientation: 'vertical'
+                            GcodeColorSchemePanel:
+                                id: color_scheme_panel
                             BoxLayout:
                                 id: tool_bar
                                 orbit: True
+                                show_grid: True
                                 size_hint_x: 1
                                 size_hint_y: None
                                 height: dp(48) if app.show_gcode_ctl_bar else 0
@@ -4200,6 +4206,14 @@
                                         disabled: app.selected_remote_filename == '' and app.selected_local_filename == ''
                                         on_release:
                                             root.gcode_viewer.restore_default_view()
+                                    GcodeViewerToolBarButton:
+                                        width: '50dp'
+                                        active: tool_bar.show_grid
+                                        icon: 'data/grid.png'
+                                        disabled: app.selected_remote_filename == '' and app.selected_local_filename == ''
+                                        on_release:
+                                            tool_bar.show_grid = not tool_bar.show_grid
+                                            root.gcode_viewer.set_grid_visible(tool_bar.show_grid)
                                     Widget:
 
                                     # tools

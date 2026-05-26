@@ -397,12 +397,21 @@ class GcodePlaySlider(Slider):
 
 class FloatBox(FloatLayout):
     touch_interval = 0
+    color_scheme_panel = ObjectProperty(None)
+
+    def _viewer_chrome_hit(self, touch):
+        if self.gcode_ctl_bar.collide_point(*touch.pos):
+            return True
+        panel = self.color_scheme_panel
+        if panel is not None and panel.collide_point(*touch.pos):
+            return True
+        return False
 
     def on_touch_down(self, touch):
         if super(FloatBox, self).on_touch_down(touch):
             return True
 
-        if self.collide_point(*touch.pos) and not self.gcode_ctl_bar.collide_point(*touch.pos):
+        if self.collide_point(*touch.pos) and not self._viewer_chrome_hit(touch):
             if ('button' in touch.profile and touch.button == 'left') or not 'button' in touch.profile:
                     self.touch_interval =  time.time()
 
@@ -411,7 +420,7 @@ class FloatBox(FloatLayout):
             return True
 
         app = App.get_running_app()
-        if self.collide_point(*touch.pos) and not self.gcode_ctl_bar.collide_point(*touch.pos):
+        if self.collide_point(*touch.pos) and not self._viewer_chrome_hit(touch):
             if ('button' in touch.profile and touch.button == 'left') or not 'button' in touch.profile:
                 if time.time() - self.touch_interval < MAX_TOUCH_INTERVAL:
                     app.show_gcode_ctl_bar = not app.show_gcode_ctl_bar
@@ -6446,6 +6455,8 @@ class Makera(RelativeLayout):
             self.gcode_viewer_distance = self.gcode_viewer.get_total_distance()
             self.gcode_viewer.show_all()
 
+        self.refresh_gcode_color_legend()
+
         app = App.get_running_app()
 
         # Only clear resume-at-line when a different file is loaded.
@@ -6584,6 +6595,20 @@ class Makera(RelativeLayout):
             tool_button.min_active = True
         self.float_layout.hide_all.active = True
 
+
+    def refresh_gcode_color_legend(self, *_args):
+        panel = self.ids.get('color_scheme_panel')
+        if panel is not None:
+            panel.refresh(self)
+
+    def on_gcode_color_scheme_changed(self, text):
+        if text == tr._('Tool'):
+            self.gcode_viewer.set_color_scheme('by_tool')
+        elif text == tr._('Speed'):
+            self.gcode_viewer.set_color_scheme('by_speed')
+        else:
+            self.gcode_viewer.set_color_scheme('by_type')
+        self.refresh_gcode_color_legend()
 
     # -----------------------------------------------------------------------
     def filter_tool(self):
