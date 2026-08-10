@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 import sys
@@ -9,12 +11,16 @@ from kivy.clock import Clock
 from kivy.config import Config
 from kivy.core.window import Window
 from kivy.graphics import *
+from kivy.graphics import Callback, Mesh
 from kivy.graphics.instructions import RenderContext
 from kivy.graphics.opengl import *
 from kivy.graphics.transformation import Matrix
 from kivy.metrics import dp
+from kivy.properties import BooleanProperty, ListProperty, NumericProperty, StringProperty
 from kivy.uix.widget import Widget
 from kivy.utils import platform
+
+from carveracontroller.translation import tr
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +48,32 @@ from kivy.input.motionevent import MotionEvent
 # input
 from kivy.input.provider import MotionEventProvider
 
+from .addons.stock.simulation_quality import (
+    CHECKPOINT_SLOTS_BY_LEVEL,
+    DEFAULT_CHECKPOINT_LEVEL,
+    DEFAULT_VOXEL_RESOLUTION,
+    VOXEL_TARGET_BY_LEVEL,
+    normalize_checkpoint_level,
+    normalize_voxel_resolution,
+)
+from .addons.stock.stock_aabb_mesh import (
+    STOCK_EDGE_COLOR,
+    STOCK_FILL_COLOR,
+    STOCK_VERTEX_FORMAT,
+    build_box_edges,
+    build_box_triangles,
+    build_cylinder_edges,
+    build_cylinder_triangles,
+)
+from .addons.stock.stock_defaults import default_bounds, default_shape
+from .addons.stock.stock_geometry import StockBounds
+from .addons.stock.stock_shape import CylindricalStock, RectangularStock, StockShape
+from .addons.stock.voxel.stock_simulator import (
+    DEFAULT_MESH_THROTTLE_S,
+    PLAY_MESH_THROTTLE_S,
+    StockSimulator,
+)
+from .addons.stock.voxel.voxel_mesher import VERTEX_FORMAT as VOXEL_VERTEX_FORMAT
 from .addons.tool_visualization.mesh_builder import build_tool_meshes
 from .arcball_from_cpp import *
 from .Objloader import ObjFile
@@ -579,7 +611,7 @@ class GCodeViewer(Widget):
     display_count = 0
     total_line_count = 0
     add_dir = 1
-    dynamic_display = True
+    dynamic_display = BooleanProperty(True)
     move_speed = 0.8
     move_scale = 1.0
     move_scale_by_positon = 1.0
@@ -589,6 +621,11 @@ class GCodeViewer(Widget):
 
     # When True, compute segment-based time estimates (distance/feed); when False, skip extra parsing.
     high_precision_time_estimate = True
+
+    # Cut-simulation stats (progress, checkpoints, HUD texts)
+    sim_progress = NumericProperty(0.0)
+    sim_checkpoints = ListProperty([])
+    sim_hud_text = StringProperty("")
 
     line_times = []
     total_time = 0.0
@@ -668,6 +705,21 @@ class GCodeViewer(Widget):
         self.linemesh = RenderContext()
         self.linemesh.shader.source = os.path.join(shader_dir, "toolpath.glsl")
 
+        self.stockmesh = RenderContext()
+        self.stockmesh.shader.source = os.path.join(shader_dir, "stock.glsl")
+
+        self.voxelmesh = RenderContext()
+        self.voxelmesh.shader.source = os.path.join(shader_dir, "voxel.glsl")
+        self.voxelmesh["vertex_scale"] = 1.0
+        self._voxel_chunk_meshes: dict[tuple[int, int, int], Mesh] = {}
+        self._voxel_mesh_anchor = None
+        with self.voxelmesh:
+            Callback(self.setup_gl_context)
+            Callback(self._setup_voxel_gl)
+            self._voxel_mesh_anchor = Callback(None)
+            Callback(self._reset_voxel_gl)
+            Callback(self.reset_gl_context)
+
         self.pointermesh = RenderContext()
         self.pointermesh.shader.source = os.path.join(shader_dir, "tool_pointer.glsl")
 
@@ -724,6 +776,36 @@ class GCodeViewer(Widget):
         self._apply_color_scheme_uniform()
         self._update_feed_range_uniforms()
         self._apply_visibility_uniforms()
+
+        # Stock preview / cut simulation state
+        self.stock_bounds_mm: StockBounds | None = None
+        self.stock_shape: StockShape | None = None
+        self.stock_visible = False
+        self.simulate_cut = False
+        self.stock_mesh_while_playing = False
+        # Keep the translucent AABB up after pause until the worker flush
+        # patches GPU chunks; otherwise the last meshed shell (often uncut)
+        # is shown for a frame.
+        self._defer_carved_stock = False
+        self.stock_voxel_resolution = DEFAULT_VOXEL_RESOLUTION
+        self.stock_checkpoint_level = DEFAULT_CHECKPOINT_LEVEL
+        self._sim_carved_vertex = 0
+        self._sim_progress_vertex = 0
+        self._sim_progress_trigger = Clock.create_trigger(self._flush_sim_progress, 0)
+        self._sim_checkpoints_trigger = Clock.create_trigger(self._flush_sim_checkpoints, 0)
+        self._pending_checkpoint_vertices: list[int] = []
+        self._stock_simulator = StockSimulator(
+            on_meshes_ready=self._on_stock_meshes_ready,
+            on_progress=self._on_stock_progress,
+            on_checkpoints=self._on_stock_checkpoints,
+        )
+        self.bind(dynamic_display=self._on_dynamic_display_changed)
+
+        # HUD lives in float_layout — this RenderContext cannot host 2D Labels.
+        self._sim_hud_trigger = Clock.create_trigger(self._refresh_sim_hud, 0)
+
+        self._apply_default_stock_settings()
+
         Clock.schedule_interval(self._on_frame_tick, 1 / 60)
 
     def _on_size_change(self, *args):
@@ -875,6 +957,9 @@ class GCodeViewer(Widget):
 
     def _add_canvas_children(self):
         self.canvas.add(self.gridmesh)
+        if self.stock_visible or self.simulate_cut:
+            self.canvas.add(self.stockmesh)
+            self.canvas.add(self.voxelmesh)
         self.canvas.add(self.linemesh)
         self.canvas.add(self.pointermesh)
         self.canvas.add(self.axisxmesh)
@@ -883,6 +968,8 @@ class GCodeViewer(Widget):
         self._raise_view_cube_to_top()
         self._update_view_cube_uniforms()
         self._viewer_meshes_active = True
+        self._update_stock_uniforms()
+        self._update_voxel_uniforms()
 
     def _grid_quad_extent(self):
         """World-space quad width so the plane covers the viewport when orbiting."""
@@ -920,6 +1007,11 @@ class GCodeViewer(Widget):
         self.linemesh.clear()
         self.canvas.remove(self.linemesh)
         self.canvas.remove(self.gridmesh)
+        if self.stockmesh in self.canvas.children:
+            self.canvas.remove(self.stockmesh)
+        if self.voxelmesh in self.canvas.children:
+            self.canvas.remove(self.voxelmesh)
+        self._clear_voxel_chunk_meshes()
         self.canvas.remove(self.pointermesh)
         self.pointermesh.clear()
         self.canvas.remove(self.axisxmesh)
@@ -930,7 +1022,20 @@ class GCodeViewer(Widget):
         self.axiszmesh.clear()
         self._remove_view_cube_from_canvas()
         self.display_count = 0
+        self._sim_carved_vertex = 0
+        self._sim_progress_vertex = 0
+        self.sim_progress = 0.0
+        self.sim_checkpoints = []
+        self.sim_hud_text = ""
+        self.stock_visible = False
+        self.simulate_cut = False
+        self._defer_carved_stock = False
         self._viewer_meshes_active = False
+        if self._stock_simulator is not None:
+            # Keep bounds/shape/quality, but pause carving until the new file finishes loading.
+            self._stock_simulator.clear_toolpath()
+            self._stock_simulator.disable()
+        self._sim_hud_trigger()
 
     def set_frame_callback(self, framecallback):
         self.frame_callback = framecallback
@@ -1157,6 +1262,11 @@ class GCodeViewer(Widget):
 
             self.pointermesh["offset"] = (-self.lines_center[0], -self.lines_center[1], -self.lines_center[2])
 
+            # Stock mesh uses the newly computed scale/center; restart simulation if enabled.
+            self._rebuild_stock_mesh()
+            self._ensure_stock_on_canvas()
+            self._restart_stock_simulation()
+
             self.m_zoom = self._default_zoom_for_projection()
             self._clamp_zoom()
             self.update_proj()
@@ -1182,7 +1292,11 @@ class GCodeViewer(Widget):
         self._proj_matrix = proj
         self.linemesh["proj_mat"] = proj
         self.gridmesh["proj_mat"] = proj
+        self.stockmesh["proj_mat"] = proj
+        self.voxelmesh["proj_mat"] = proj
         self._update_grid_uniforms()
+        self._update_stock_uniforms()
+        self._update_voxel_uniforms()
         self.pointermesh["projection_mat"] = proj
         self.axisxmesh["projection_mat"] = proj
         self.axisymesh["projection_mat"] = proj
@@ -1210,6 +1324,8 @@ class GCodeViewer(Widget):
             eye[0], eye[1], eye[2], center[0], center[1], center[2], up[0], up[1], up[2]
         )
         self._update_grid_uniforms()
+        self._update_stock_uniforms()
+        self._update_voxel_uniforms()
         self._update_view_cube_uniforms()
 
     def setup_gl_context(self, *args):
@@ -1217,6 +1333,9 @@ class GCodeViewer(Widget):
         glEnable(GL_DEPTH_TEST)
 
     def reset_gl_context(self, *args):
+        # Depth mask is global GL state shared with voxelmesh / linemesh — always
+        # restore writes after stock (translucent fill may have disabled them).
+        glDepthMask(GL_TRUE)
         glDisable(GL_DEPTH_TEST)
         glViewport(0, 0, Window.size[0], Window.size[1])
         pass
@@ -1252,6 +1371,7 @@ class GCodeViewer(Widget):
                     self.lengths[line_index + 1] - self.lengths[line_index]
                 )
             self.cur_line_index = line_index + line_ratio
+            self._sync_stock_simulation(int(self.cur_line_index))
         # Trigger frame callback to update line highlighting
         if self.frame_callback is not None:
             cur_distance, linenumber = self.get_cur_pos_index()
@@ -1659,6 +1779,432 @@ class GCodeViewer(Widget):
         self._apply_color_scheme_uniform()
         self._scene_dirty = True
 
+    def simulation_available(self) -> bool:
+        """True when the loaded file has CAM tool definitions usable for cut simulation."""
+        return bool(self.tool_table)
+
+    def _apply_default_stock_settings(self) -> None:
+        try:
+            self.set_stock(
+                default_bounds(),
+                visible=False,
+                simulate_cut=False,
+                shape=default_shape(),
+            )
+        except Exception:
+            logger.exception("failed to apply default stock settings")
+
+    def set_stock(
+        self,
+        bounds: StockBounds | None,
+        visible: bool = True,
+        simulate_cut: bool = False,
+        voxel_resolution: str = DEFAULT_VOXEL_RESOLUTION,
+        checkpoint_level: str = DEFAULT_CHECKPOINT_LEVEL,
+        mesh_while_playing: bool = False,
+        shape: StockShape | None = None,
+    ) -> None:
+        """Configure stock display and optional cut simulation."""
+        self.stock_bounds_mm = bounds
+        if shape is not None:
+            self.stock_shape = shape
+        elif bounds is not None and self.stock_shape is None:
+            sx, sy, sz = bounds.size
+            self.stock_shape = RectangularStock(
+                width_mm=max(sx, 1e-6),
+                length_mm=max(sy, 1e-6),
+                height_mm=max(sz, 1e-6),
+            )
+        self.stock_visible = bool(visible) and bounds is not None
+        want_sim = bool(simulate_cut) and self.simulation_available() and self.stock_visible
+        self.simulate_cut = want_sim
+        self.stock_mesh_while_playing = bool(mesh_while_playing)
+        self.stock_voxel_resolution = normalize_voxel_resolution(voxel_resolution)
+        self.stock_checkpoint_level = normalize_checkpoint_level(checkpoint_level)
+        self._defer_carved_stock = False
+
+        self._rebuild_stock_mesh()
+        self._ensure_stock_on_canvas()
+        self._restart_stock_simulation()
+        self._scene_dirty = True
+        self._sim_hud_trigger()
+
+    def _format_sim_hud_text(self) -> str:
+        if not self.simulate_cut or self._stock_simulator is None:
+            return ""
+        stats = self._stock_simulator.hud_stats()
+        if not stats:
+            return ""
+
+        voxel_mm = stats["voxel_size_mm"]
+        if voxel_mm >= 1.0 or abs(voxel_mm - round(voxel_mm)) < 1e-6:
+            voxel_txt = f"{voxel_mm:.1f}" if voxel_mm < 10 else f"{voxel_mm:.0f}"
+        else:
+            voxel_txt = f"{voxel_mm:.2f}"
+
+        # Furthest checkpoint as path-distance percent (same basis as the scrubber ticks).
+        head_pct = 0.0
+        if int(stats["checkpoint_count"]) > 0:
+            head_pct = self._vertex_to_path_percent(stats["checkpoint_head_vertex"])
+
+        return "\n".join(
+            [
+                tr._("Grid: %dx%dx%d - %smm/voxel")
+                % (
+                    int(stats["grid_nx"]),
+                    int(stats["grid_ny"]),
+                    int(stats["grid_nz"]),
+                    voxel_txt,
+                ),
+                tr._("Checkpoints: %.0f%% - %d/%d slots")
+                % (
+                    head_pct,
+                    int(stats["checkpoint_count"]),
+                    int(stats["checkpoint_max_count"]),
+                ),
+            ]
+        )
+
+    def _refresh_sim_hud(self, *_args) -> None:
+        self.sim_hud_text = self._format_sim_hud_text()
+
+    def _vertex_to_path_percent(self, vertex: int) -> float:
+        total = self.get_total_distance() if self.lengths else 0.0
+        if total <= 0 or not self.lengths:
+            return 0.0
+        v = max(0, min(int(vertex), len(self.lengths) - 1))
+        return float(self.lengths[v]) / float(total) * 100.0
+
+    def _ensure_stock_on_canvas(self) -> None:
+        if not self._viewer_meshes_active:
+            return
+        show_stock = self.stock_visible or self.simulate_cut
+        show_voxels = self._carved_stock_visible()
+        for mesh in (self.stockmesh, self.voxelmesh):
+            if mesh in self.canvas.children:
+                self.canvas.remove(mesh)
+        if not show_stock:
+            self._clear_voxel_chunk_meshes()
+            return
+        try:
+            idx = self.canvas.children.index(self.gridmesh) + 1
+            self.canvas.insert(idx, self.stockmesh)
+            if show_voxels:
+                self.canvas.insert(idx + 1, self.voxelmesh)
+        except ValueError:
+            self.canvas.add(self.stockmesh)
+            if show_voxels:
+                self.canvas.add(self.voxelmesh)
+        self._raise_view_cube_to_top()
+
+    def _stock_scale(self) -> float:
+        return float(self.move_scale_by_positon or 1.0)
+
+    def _mm_to_viewer(self, x: float, y: float, z: float) -> tuple[float, float, float]:
+        s = self._stock_scale()
+        return (x * s, y * s, z * s)
+
+    def _carved_stock_visible(self) -> bool:
+        """True when opaque voxel stock should be drawn.
+
+        During playback this follows ``stock_mesh_while_playing`` so low-end
+        machines can keep the translucent AABB and skip live remesh. After
+        pause, ``_defer_carved_stock`` keeps that AABB until the flush
+        patches GPU chunks so the stale uncut shell is not flashed.
+        """
+        if self._defer_carved_stock:
+            return False
+        return bool(self.simulate_cut) and (
+            (not self.dynamic_display) or bool(self.stock_mesh_while_playing)
+        )
+
+    def _rebuild_stock_mesh(self) -> None:
+        self.stockmesh.clear()
+        if self.stock_bounds_mm is None:
+            return
+
+        b = self.stock_bounds_mm
+        # Corners in viewer-scaled space (before center_offset).
+        x0, y0, z0 = self._mm_to_viewer(b.min_x, b.min_y, b.min_z)
+        x1, y1, z1 = self._mm_to_viewer(b.max_x, b.max_y, b.max_z)
+
+        shape = self.stock_shape
+        if isinstance(shape, CylindricalStock):
+            cx = 0.5 * (x0 + x1)
+            cy = 0.5 * (y0 + y1)
+            radius = 0.5 * min(abs(x1 - x0), abs(y1 - y0))
+            edge_verts, edge_idx = build_cylinder_edges(cx, cy, z0, z1, radius, STOCK_EDGE_COLOR)
+            fill_verts = fill_idx = None
+            if not self._carved_stock_visible():
+                fill_verts, fill_idx = build_cylinder_triangles(cx, cy, z0, z1, radius, STOCK_FILL_COLOR)
+        else:
+            edge_verts, edge_idx = build_box_edges(x0, y0, z0, x1, y1, z1, STOCK_EDGE_COLOR)
+            fill_verts = fill_idx = None
+            if not self._carved_stock_visible():
+                fill_verts, fill_idx = build_box_triangles(x0, y0, z0, x1, y1, z1, STOCK_FILL_COLOR)
+
+        with self.stockmesh:
+            Callback(self.setup_gl_context)
+            if fill_verts is not None:
+                Callback(self._setup_stock_back_faces)
+                Mesh(fmt=STOCK_VERTEX_FORMAT, vertices=fill_verts, indices=fill_idx, mode="triangles")
+                Callback(self._setup_stock_front_faces)
+                Mesh(fmt=STOCK_VERTEX_FORMAT, vertices=fill_verts, indices=fill_idx, mode="triangles")
+            Callback(self._setup_stock_edges)
+            Mesh(fmt=STOCK_VERTEX_FORMAT, vertices=edge_verts, indices=edge_idx, mode="lines")
+            Callback(self.reset_gl_context)
+
+        self._update_stock_uniforms()
+
+    def _setup_stock_back_faces(self, *_args):
+        glEnable(GL_CULL_FACE)
+        glCullFace(GL_FRONT)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        # Translucent AABB must not stamp depth or toolpath/voxels disappear.
+        glDepthMask(GL_FALSE)
+        self.stockmesh["use_lighting"] = 1.0
+
+    def _setup_stock_front_faces(self, *_args):
+        glCullFace(GL_BACK)
+        glDepthMask(GL_FALSE)
+        self.stockmesh["use_lighting"] = 1.0
+
+    def _setup_stock_edges(self, *_args):
+        glDisable(GL_CULL_FACE)
+        # Edge lines should write depth; also safety before reset_gl_context.
+        glDepthMask(GL_TRUE)
+        self.stockmesh["use_lighting"] = 0.0
+
+    def _update_stock_uniforms(self) -> None:
+        center = getattr(self, "lines_center", [0.0, 0.0, 0.0])
+        self.stockmesh["center_offset"] = Matrix().translate(-center[0], -center[1], -center[2])
+        self.stockmesh["view_mat"] = self.m_viewMatrix
+        self.stockmesh["proj_mat"] = self._proj_matrix
+        self.stockmesh["rotation_mat"] = self._identity_mat
+        self.stockmesh["use_lighting"] = 1.0
+
+    def _update_voxel_uniforms(self) -> None:
+        center = getattr(self, "lines_center", [0.0, 0.0, 0.0])
+        self.voxelmesh["center_offset"] = Matrix().translate(-center[0], -center[1], -center[2])
+        self.voxelmesh["view_mat"] = self.m_viewMatrix
+        self.voxelmesh["proj_mat"] = self._proj_matrix
+        self.voxelmesh["rotation_mat"] = self._identity_mat
+        self.voxelmesh["vertex_scale"] = self._stock_scale()
+        # Height tint range in the same viewer-scaled space as mesh vertex Z.
+        bounds = self.stock_bounds_mm
+        if bounds is not None:
+            scale = self._stock_scale()
+            self.voxelmesh["stock_z_min"] = float(bounds.min_z) * scale
+            self.voxelmesh["stock_z_max"] = float(bounds.max_z) * scale
+        else:
+            self.voxelmesh["stock_z_min"] = 0.0
+            self.voxelmesh["stock_z_max"] = 1.0
+
+    def _clear_voxel_chunk_meshes(self) -> None:
+        self.voxelmesh.clear()
+        self._voxel_chunk_meshes = {}
+        # Keep GL setup/teardown callbacks so subsequent Mesh children render correctly.
+        with self.voxelmesh:
+            Callback(self.setup_gl_context)
+            Callback(self._setup_voxel_gl)
+            self._voxel_mesh_anchor = Callback(None)
+            Callback(self._reset_voxel_gl)
+            Callback(self.reset_gl_context)
+
+    def _setup_voxel_gl(self, *_args):
+        # Opaque remaining-stock surfaces: depth writes so pocket floors are visible
+        # instead of stacking translucent brown layers.
+        glEnable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
+        glCullFace(GL_BACK)
+
+    def _reset_voxel_gl(self, *_args):
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+
+    def _on_stock_meshes_ready(self, meshes: dict) -> None:
+        """Called from the simulator worker thread — hop onto the Kivy clock."""
+        # Capture generation so stale worker results are ignored after reset/disable.
+        gen = self._stock_simulator.generation if self._stock_simulator else -1
+
+        def _apply(_dt, meshes=meshes, gen=gen):
+            if self._stock_simulator is None or self._stock_simulator.generation != gen:
+                return
+            self._apply_stock_meshes(meshes)
+
+        Clock.schedule_once(_apply, 0)
+
+    def _apply_stock_meshes(self, meshes: dict) -> None:
+        # Special sentinels from disable / seek-back.
+        if meshes and "__clear_all__" in meshes:
+            self._clear_voxel_chunk_meshes()
+            self._defer_carved_stock = False
+            self._scene_dirty = True
+            return
+        reveal = self._defer_carved_stock
+        # Keep GPU buffers in sync even when voxelmesh is off-canvas (play with
+        # live mesh off). Hide by not drawing, not by dropping patches.
+        if meshes and "__replace__" in meshes:
+            self._clear_voxel_chunk_meshes()
+            meshes = meshes.get("__replace__") or {}
+        for key, packed in meshes.items():
+            existing = self._voxel_chunk_meshes.get(key)
+            if packed is None:
+                if existing is not None:
+                    self.voxelmesh.remove(existing)
+                    del self._voxel_chunk_meshes[key]
+                continue
+            vertices_mm, indices, fmt = packed
+            if existing is not None:
+                existing.vertices = vertices_mm
+                existing.indices = indices
+            else:
+                mesh = Mesh(fmt=fmt or VOXEL_VERTEX_FORMAT, vertices=vertices_mm, indices=indices, mode="triangles")
+                # Insert before the reset callbacks (after the anchor).
+                try:
+                    anchor_idx = self.voxelmesh.children.index(self._voxel_mesh_anchor)
+                    self.voxelmesh.insert(anchor_idx + 1, mesh)
+                except (ValueError, AttributeError):
+                    self.voxelmesh.add(mesh)
+                self._voxel_chunk_meshes[key] = mesh
+        self._update_voxel_uniforms()
+        if reveal:
+            self._reveal_carved_stock_if_deferred()
+        self._scene_dirty = True
+
+    def _reveal_carved_stock_if_deferred(self) -> None:
+        """Swap AABB fill for voxels after a pause flush has patched GPU chunks."""
+        if not self._defer_carved_stock:
+            return
+        self._defer_carved_stock = False
+        self._rebuild_stock_mesh()
+        self._ensure_stock_on_canvas()
+
+    def _restart_stock_simulation(self) -> None:
+        self._sim_carved_vertex = 0
+        self._sim_progress_vertex = 0
+        self.sim_progress = 0.0
+        self.sim_checkpoints = []
+        self._defer_carved_stock = False
+        self._clear_voxel_chunk_meshes()
+        if not self.simulate_cut or self.stock_bounds_mm is None:
+            self._stock_simulator.disable()
+            self._sim_hud_trigger()
+            return
+        self._publish_toolpath_to_simulator()
+        self._stock_simulator.reset(
+            self.stock_bounds_mm,
+            enable=True,
+            voxel_target=VOXEL_TARGET_BY_LEVEL[self.stock_voxel_resolution],
+            checkpoint_slots=CHECKPOINT_SLOTS_BY_LEVEL[self.stock_checkpoint_level],
+            shape=self.stock_shape,
+        )
+        self._sync_play_mesh_policy(rebuild=False)
+        if self.lengths and self.raw_positions:
+            target = int(getattr(self, "cur_line_index", 0) or 0)
+            self._stock_simulator.set_display_vertex(target)
+            if not self.dynamic_display:
+                self._stock_simulator.submit_idle_precompute(target)
+        self._sim_hud_trigger()
+
+    def _on_stock_progress(self, vertex: int) -> None:
+        """Worker/UI progress emit — hop onto the Kivy clock with a generation stamp."""
+        sim = self._stock_simulator
+        gen = sim.generation if sim else -1
+        v = int(vertex)
+
+        def _apply(_dt, v=v, gen=gen):
+            if self._stock_simulator is None or self._stock_simulator.generation != gen:
+                return
+            self._sim_progress_vertex = v
+            self._sim_carved_vertex = v
+            self._sim_progress_trigger()
+            self._sim_hud_trigger()
+
+        Clock.schedule_once(_apply, 0)
+
+    def _sync_play_mesh_policy(self, *, rebuild: bool = True) -> None:
+        """Match mesh emits / AABB fill to play vs pause and the live-mesh option."""
+        sim = self._stock_simulator
+        if sim is None:
+            return
+        if self.simulate_cut:
+            playing = bool(self.dynamic_display)
+            if playing:
+                sim.set_idle_ahead_allowed(False)
+                sim.cancel_idle_precompute()
+            else:
+                sim.set_idle_ahead_allowed(True)
+            live = (not playing) or bool(self.stock_mesh_while_playing)
+            sim.set_mesh_updates_enabled(live)
+            sim.set_mesh_throttle_s(
+                PLAY_MESH_THROTTLE_S if playing else DEFAULT_MESH_THROTTLE_S
+            )
+        if rebuild:
+            self._rebuild_stock_mesh()
+            self._ensure_stock_on_canvas()
+
+    def _on_dynamic_display_changed(self, _instance, playing: bool) -> None:
+        if playing or not self.simulate_cut or self.stock_mesh_while_playing:
+            self._defer_carved_stock = False
+        else:
+            # Live mesh was off during play: keep the AABB until flush patches.
+            self._defer_carved_stock = True
+        self._sync_play_mesh_policy()
+        if (not playing) and self.simulate_cut and self.raw_positions:
+            target = int(getattr(self, "cur_line_index", 0) or 0)
+            self._stock_simulator.set_display_vertex(target)
+            self._stock_simulator.request_mesh_flush()
+            self._stock_simulator.submit_idle_precompute(target)
+        self._scene_dirty = True
+
+    def _on_stock_checkpoints(self, vertices: list[int]) -> None:
+        """Worker/UI checkpoint list — hop onto the Kivy clock with a generation stamp."""
+        sim = self._stock_simulator
+        gen = sim.generation if sim else -1
+        verts = list(vertices or [])
+
+        def _apply(_dt, verts=verts, gen=gen):
+            if self._stock_simulator is None or self._stock_simulator.generation != gen:
+                return
+            self._pending_checkpoint_vertices = verts
+            self._sim_checkpoints_trigger()
+            self._sim_hud_trigger()
+
+        Clock.schedule_once(_apply, 0)
+
+    def _flush_sim_progress(self, *_args) -> None:
+        if not self.simulate_cut:
+            self.sim_progress = 0.0
+            return
+        self.sim_progress = self._vertex_to_path_percent(self._sim_progress_vertex)
+
+    def _flush_sim_checkpoints(self, *_args) -> None:
+        if not self.simulate_cut:
+            self.sim_checkpoints = []
+            return
+        self.sim_checkpoints = [self._vertex_to_path_percent(vertex) for vertex in self._pending_checkpoint_vertices]
+
+    def _publish_toolpath_to_simulator(self) -> None:
+        """Hand the loaded path buffers to the worker (no copy — read-only after load)."""
+        if self._stock_simulator is None:
+            return
+        # tool_unit_scale only (not move_scale_by_positon): carving is mm WCS.
+        self._stock_simulator.set_toolpath(
+            self.raw_positions,
+            self.vertex_types,
+            self.raw_tools,
+            self.tool_table,
+            tool_scale=float(self.tool_unit_scale or 1.0),
+        )
+
+    def _sync_stock_simulation(self, current_vertex: int) -> None:
+        if not self.simulate_cut or not self.raw_positions:
+            return
+        self._stock_simulator.set_display_vertex(max(0, int(current_vertex)))
+
     # repeat this function every 1/60 s
     def _on_frame_tick(self, _):
         # Recompute projection only when it is actually stale (resize / zoom / pan).
@@ -1703,6 +2249,7 @@ class GCodeViewer(Widget):
         line_index_withratio = line_index + line_ratio
 
         self.cur_line_index = line_index_withratio
+        self._sync_stock_simulation(int(line_index_withratio))
 
         self._update_pointer_tool_mesh(int(line_index_withratio))
 
@@ -1720,6 +2267,8 @@ class GCodeViewer(Widget):
 
         self.linemesh["view_mat"] = self.m_viewMatrix
         self._update_grid_uniforms()
+        self._update_stock_uniforms()
+        self._update_voxel_uniforms()
 
         pointer_updated_pos = 3 * int(line_index_withratio)
 

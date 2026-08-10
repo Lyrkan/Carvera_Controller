@@ -81,7 +81,7 @@ from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.config import Config
 from kivy.factory import Factory
-from kivy.graphics import Color, Ellipse, Line, PopMatrix, PushMatrix, Rectangle, Rotate, Translate
+from kivy.graphics import Color, Ellipse, InstructionGroup, Line, PopMatrix, PushMatrix, Rectangle, Rotate, Translate
 from kivy.metrics import Metrics, dp
 from kivy.properties import (
     BooleanProperty,
@@ -120,6 +120,15 @@ from carveracontroller.addons.pendant import (
     SettingPendantSelector,
 )
 from carveracontroller.addons.probing.ProbingPopup import ProbingPopup
+from carveracontroller.addons.stock.stock_defaults import (
+    bounds_from_settings,
+    checkpoint_level_from_settings,
+    default_settings,
+    mesh_while_playing_from_settings,
+    shape_from_settings,
+    voxel_resolution_from_settings,
+)
+from carveracontroller.addons.stock.ui.StockSettingsPopup import StockSettingsPopup
 from carveracontroller.serial_listeners import dispatch_serial_line
 
 
@@ -380,9 +389,70 @@ class MDITextInput(TextInput):
 
 
 class GcodePlaySlider(Slider):
+    """Preview timeline scrubber with a thin green cut-simulation progress strip
+    and blue checkpoint markers."""
+
+    sim_progress = NumericProperty(0.0)  # 0–100, path-distance percent carved by the voxel sim
+    sim_checkpoints = ListProperty([])  # path-distance percents (0–100) of stored checkpoints
+    _SIM_BAR_COLOR = (0.25, 0.82, 0.35, 0.95)
+    _SIM_MARKER_COLOR = (0.3, 0.55, 0.95, 1.0)
+    _SIM_BAR_HEIGHT = dp(3)
+    _SIM_MARKER_WIDTH = dp(2)
+    _SIM_MARKER_HEIGHT = dp(7)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._pending_line_update = None  # Track pending scheduled line update
+        with self.canvas.after:
+            self._sim_color = Color(*self._SIM_BAR_COLOR)
+            self._sim_rect = Rectangle(pos=(0, 0), size=(0, 0))
+            self._sim_marker_group = InstructionGroup()
+        self.bind(
+            pos=self._update_sim_bar,
+            size=self._update_sim_bar,
+            padding=self._update_sim_bar,
+            min=self._update_sim_bar,
+            max=self._update_sim_bar,
+            sim_progress=self._update_sim_bar,
+            sim_checkpoints=self._update_sim_bar,
+        )
+
+    def _update_sim_bar(self, *_args):
+        if not hasattr(self, "_sim_rect"):
+            return
+        progress = float(self.sim_progress or 0.0)
+        pad = float(self.padding)
+        track_w = max(0.0, self.width - 2.0 * pad) if self.width > 0 else 0.0
+        bar_h = float(self._SIM_BAR_HEIGHT)
+        bar_y = self.y + dp(1)
+
+        if progress <= 0 or track_w <= 0 or self.height <= 0:
+            self._sim_rect.size = (0, 0)
+        else:
+            fill_w = track_w * min(100.0, progress) / 100.0
+            self._sim_rect.pos = (self.x + pad, bar_y)
+            self._sim_rect.size = (fill_w, bar_h)
+
+        # Checkpoint ticks on the sim strip (full track so future restore points stay visible).
+        group = getattr(self, "_sim_marker_group", None)
+        if group is None:
+            return
+        group.clear()
+        if track_w <= 0 or self.height <= 0:
+            return
+        marker_w = float(self._SIM_MARKER_WIDTH)
+        marker_h = float(self._SIM_MARKER_HEIGHT)
+        marker_y = bar_y + (bar_h - marker_h) / 2.0
+        for pct in self.sim_checkpoints or []:
+            try:
+                p = float(pct)
+            except (TypeError, ValueError):
+                continue
+            if p < 0.0 or p > 100.0:
+                continue
+            x = self.x + pad + track_w * (p / 100.0) - marker_w / 2.0
+            group.add(Color(*self._SIM_MARKER_COLOR))
+            group.add(Rectangle(pos=(x, marker_y), size=(marker_w, marker_h)))
 
     def on_touch_down(self, touch):
         if self.disabled:
@@ -3133,6 +3203,7 @@ class Makera(RelativeLayout):
         self.probing_popup = ProbingPopup(self.controller)
         self.cmm_workbench_popup = None
         self.facing_popup = FacingWizardPopup()
+        self.stock_settings_popup = StockSettingsPopup()
         self.adv_calibrate_popup = AdvCalibratePopup()
         self.wcs_settings_popup = WCSSettingsPopup(self.controller, self.wcs_names)
         self.set_rotation_popup = SetRotationPopup(self.controller, self.cnc)
@@ -3159,6 +3230,10 @@ class Makera(RelativeLayout):
         self.gcode_viewer.set_play_over_callback(self.gcode_play_over_call_back)
         self.gcode_viewer.set_error_popup_callback(self._on_gcode_cannot_visualise)
         self.gcode_viewer.time_estimate_progress_callback = self._on_time_estimate_progress
+        self.gcode_viewer.bind(sim_progress=self._on_viewer_sim_progress)
+        self.gcode_viewer.bind(sim_checkpoints=self._on_viewer_sim_checkpoints)
+        self.gcode_viewer.bind(sim_hud_text=self._on_viewer_sim_hud_text)
+        self._on_viewer_sim_hud_text(self.gcode_viewer, self.gcode_viewer.sim_hud_text)
         self.float_layout.tool_bar.show_grid = self.gcode_viewer.is_grid_visible()
         self.path_hidden_tools = set()
 
@@ -3494,6 +3569,67 @@ class Makera(RelativeLayout):
         self._pre_modal_keyboard_jog = self.keyboard_jog_control
         self.toggle_keyboard_jog_control(True)
         self.facing_popup.open()
+
+    def open_stock_settings_popup(self):
+        # Stock preview/simulation is XYZ-only; A-axis toolpaths are unsupported.
+        if App.get_running_app().has_4axis:
+            return
+        self._pre_modal_keyboard_jog = self.keyboard_jog_control
+        self.toggle_keyboard_jog_control(True)
+        self.stock_settings_popup.open()
+
+    def apply_stock_settings(self, settings: dict) -> bool:
+        """Push stock settings from the popup into the 3D viewer.
+
+        Must be called on the main thread (popup Apply is). Not ``@mainthread``:
+        Kivy's decorator always schedules and returns ``None``, so the popup
+        could not observe success/failure.
+        """
+        return self._apply_stock_settings_impl(settings)
+
+    def _apply_stock_settings_impl(self, settings: dict) -> bool:
+        """Apply stock settings on the calling thread (must already be main thread)."""
+        if self.gcode_viewer is None:
+            return False
+        # Keep stock off for 4th-axis files even if settings somehow request it.
+        if App.get_running_app().has_4axis:
+            settings = dict(settings)
+            settings["show_stock"] = False
+            settings["simulate_cut"] = False
+        try:
+            bounds = bounds_from_settings(settings)
+            simulate = bool(settings.get("simulate_cut", False)) and self.gcode_viewer.simulation_available()
+            self.gcode_viewer.set_stock(
+                bounds,
+                visible=bool(settings.get("show_stock", False)),
+                simulate_cut=simulate,
+                voxel_resolution=voxel_resolution_from_settings(settings),
+                checkpoint_level=checkpoint_level_from_settings(settings),
+                mesh_while_playing=mesh_while_playing_from_settings(settings),
+                shape=shape_from_settings(settings),
+            )
+        except Exception:
+            logger.exception("failed to apply stock settings")
+            return False
+        return True
+
+    @mainthread
+    def reset_stock_for_loaded_file(self):
+        """Reset session stock toggles and re-apply settings after a file load.
+
+        Must run on the main thread — touches popup widgets and rebuilds GL meshes.
+        Uses the last *applied* snapshot (not live UI) so an open popup's dirty
+        or invalid edits are discarded rather than committed.
+
+        Calls ``_apply_stock_settings_impl`` directly so apply runs in this same
+        Clock callback (same thread as the popup widget updates above).
+        """
+        popup = getattr(self, "stock_settings_popup", None)
+        if popup is not None:
+            settings = popup.reset_for_loaded_file()
+        else:
+            settings = default_settings()
+        self._apply_stock_settings_impl(settings)
 
     def open_adv_calibrate_popup(self):
         app = App.get_running_app()
@@ -7338,6 +7474,25 @@ class Makera(RelativeLayout):
         self.controller.defaultConfigCommand()
 
     # -----------------------------------------------------------------------
+    def _on_viewer_sim_progress(self, _instance, value):
+        """Mirror voxel-sim catch-up onto the preview timeline scrubber."""
+        slider = getattr(self, "gcode_play_slider", None)
+        if slider is not None:
+            slider.sim_progress = float(value or 0.0)
+
+    def _on_viewer_sim_checkpoints(self, _instance, value):
+        """Mirror sim checkpoint positions onto the preview timeline scrubber."""
+        slider = getattr(self, "gcode_play_slider", None)
+        if slider is not None:
+            slider.sim_checkpoints = list(value or [])
+
+    def _on_viewer_sim_hud_text(self, _instance, value):
+        """Mirror cut-simulation stats onto the viewer overlay label."""
+        label = getattr(self, "sim_stats_hud", None)
+        if label is not None:
+            label.text = value or ""
+
+    # -----------------------------------------------------------------------
     def gcode_play_call_back(self, distance, line_number):
         if not self.loading_file:
             self.gcode_play_slider.value = distance * 1000.0 / self.gcode_viewer_distance
@@ -7451,6 +7606,11 @@ class Makera(RelativeLayout):
         app = App.get_running_app()
         app.curr_page = 1
         app.total_pages = 1
+        # Sync stock session toggles with cleared viewer (cancel load / clear file).
+        popup = getattr(self, "stock_settings_popup", None)
+        if popup is not None:
+            settings = popup.reset_for_loaded_file()
+            self._apply_stock_settings_impl(settings)
         self.updateStatus()
 
     # ------------------------------------------------------------------------
@@ -7595,6 +7755,14 @@ class Makera(RelativeLayout):
         if app.has_4axis:
             self.coord_popup.set_config("leveling", "active", False)
             self.coord_popup.set_config("origin", "anchor", 3)
+            # Stock is XYZ-only; drop any preview/simulation for rotary files.
+            popup = getattr(self, "stock_settings_popup", None)
+            if popup is not None:
+                popup.dismiss()
+                settings = popup.reset_for_loaded_file()
+            else:
+                settings = default_settings()
+            self._apply_stock_settings_impl(settings)
         else:
             if (CNC.vars["wcox"] - CNC.vars["anchor1_x"] - CNC.vars["anchor2_offset_x"]) >= 0 and (
                 CNC.vars["wcoy"] - CNC.vars["anchor1_y"] - CNC.vars["anchor2_offset_y"]
@@ -7665,16 +7833,23 @@ class Makera(RelativeLayout):
                 if not self._verify_deferred_download_md5(filepath):
                     return
 
+            # Load all lines from the file
             self.cnc.init()
             f = open(filepath, encoding="utf-8")
             self.lines = f.readlines()
             self.selected_file_line_count = len(self.lines)
             f.close()
 
+            # Detect tools and set document unit if available
             self.document_unit = detect_document_unit(self.lines)
             self.tool_table = extract_tool_table(self.lines)
             self.gcode_viewer.tool_table = self.tool_table
             self.gcode_viewer.tool_unit_scale = unit_scale_to_mm(self.document_unit)
+
+            # Reset current stock settings for the new file
+            self.reset_stock_for_loaded_file()
+
+            # Load the first "page" of the file
             app = App.get_running_app()
             app.total_pages = int(self.selected_file_line_count / MAX_LOAD_LINES) + (
                 0 if self.selected_file_line_count % MAX_LOAD_LINES == 0 else 1

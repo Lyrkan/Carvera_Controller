@@ -6,6 +6,7 @@ CORNER_BL = "bl"
 CORNER_BR = "br"
 CORNER_TL = "tl"
 CORNER_TR = "tr"
+CORNER_CENTER = "center"
 
 
 def stock_rect_from_origin_corner(
@@ -25,7 +26,9 @@ def stock_rect_from_origin_corner(
         return (0.0, -sl, w, 0.0)
     if c == CORNER_TR:
         return (-w, -sl, 0.0, 0.0)
-    raise ValueError("stock corner must be bl, br, tl, or tr")
+    if c == CORNER_CENTER:
+        return (-0.5 * w, -0.5 * sl, 0.5 * w, 0.5 * sl)
+    raise ValueError("stock corner must be bl, br, tl, tr, or center")
 
 
 def rect_with_xy_margin(
