@@ -166,3 +166,84 @@ def build_cylinder_edges(cx, cy, z0, z1, radius, color, segments: int = DEFAULT_
         indices.extend([i, segments + i])
 
     return vertices, indices
+
+
+def build_x_cylinder_triangles(cy, cz, x0, x1, radius, color, segments: int = DEFAULT_CYLINDER_SEGMENTS):
+    """Return (vertices, indices) for an X-axis cylinder (side + caps)."""
+    if segments < 3:
+        raise ValueError("segments must be >= 3")
+    cr, cg, cb, ca = color
+    vertices: list[float] = []
+    indices: list[int] = []
+
+    def add_vert(x, y, z, nx, ny, nz):
+        vertices.extend([x, y, z, nx, ny, nz, cr, cg, cb, ca])
+
+    side_base = 0
+    for i in range(segments):
+        ang = 2.0 * math.pi * i / segments
+        ny = math.cos(ang)
+        nz = math.sin(ang)
+        y = cy + radius * ny
+        z = cz + radius * nz
+        add_vert(x0, y, z, 0.0, ny, nz)
+        add_vert(x1, y, z, 0.0, ny, nz)
+    for i in range(segments):
+        i0 = side_base + 2 * i
+        i1 = side_base + 2 * ((i + 1) % segments)
+        indices.extend([i0, i0 + 1, i1 + 1, i0, i1 + 1, i1])
+
+    cap0_center = len(vertices) // FLOATS_PER_VERTEX
+    add_vert(x0, cy, cz, -1.0, 0.0, 0.0)
+    cap0_ring = cap0_center + 1
+    for i in range(segments):
+        ang = 2.0 * math.pi * i / segments
+        y = cy + radius * math.cos(ang)
+        z = cz + radius * math.sin(ang)
+        add_vert(x0, y, z, -1.0, 0.0, 0.0)
+    for i in range(segments):
+        indices.extend([cap0_center, cap0_ring + ((i + 1) % segments), cap0_ring + i])
+
+    cap1_center = len(vertices) // FLOATS_PER_VERTEX
+    add_vert(x1, cy, cz, 1.0, 0.0, 0.0)
+    cap1_ring = cap1_center + 1
+    for i in range(segments):
+        ang = 2.0 * math.pi * i / segments
+        y = cy + radius * math.cos(ang)
+        z = cz + radius * math.sin(ang)
+        add_vert(x1, y, z, 1.0, 0.0, 0.0)
+    for i in range(segments):
+        indices.extend([cap1_center, cap1_ring + i, cap1_ring + ((i + 1) % segments)])
+
+    return vertices, indices
+
+
+def build_x_cylinder_edges(
+    cy, cz, x0, x1, radius, color, segments: int = DEFAULT_CYLINDER_SEGMENTS, verticals: int = 4
+):
+    """Return (vertices, indices) for end rings and a few axial edges."""
+    if segments < 3:
+        raise ValueError("segments must be >= 3")
+    cr, cg, cb, ca = color
+    vertices: list[float] = []
+    indices: list[int] = []
+
+    def add_vert(x, y, z):
+        vertices.extend([x, y, z, 0.0, 0.0, 1.0, cr, cg, cb, ca])
+
+    for x in (x0, x1):
+        for i in range(segments):
+            ang = 2.0 * math.pi * i / segments
+            add_vert(x, cy + radius * math.cos(ang), cz + radius * math.sin(ang))
+
+    for ring in (0, 1):
+        base = ring * segments
+        for i in range(segments):
+            indices.extend([base + i, base + ((i + 1) % segments)])
+
+    n_vert = max(1, min(int(verticals), segments))
+    for k in range(n_vert):
+        i = (k * segments) // n_vert
+        indices.extend([i, segments + i])
+
+    return vertices, indices

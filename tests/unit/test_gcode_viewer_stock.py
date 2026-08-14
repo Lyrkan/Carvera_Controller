@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from carveracontroller.GcodeViewer import GCodeViewer
 
 
@@ -94,3 +96,45 @@ def test_clear_all_does_not_reveal_deferred_carved_stock():
     viewer._clear_voxel_chunk_meshes.assert_called_once()
     viewer._rebuild_stock_mesh.assert_not_called()
     viewer._ensure_stock_on_canvas.assert_not_called()
+
+
+def test_stock_uniforms_keep_a_axis_rotation():
+    """Orbit/resize must not reset stock A rotation to identity."""
+    from kivy.graphics.transformation import Matrix
+
+    rot = Matrix().rotate(0.8, 1, 0, 0)
+    viewer = _viewer(
+        _stock_rotation_mat=rot,
+        lines_center=[0.0, 0.0, 0.0],
+        m_viewMatrix=Matrix(),
+        _proj_matrix=Matrix(),
+        stock_bounds_mm=None,
+    )
+    viewer.stockmesh = {}
+    viewer.voxelmesh = {}
+    viewer._stock_scale = lambda: 1.0
+
+    GCodeViewer._update_stock_uniforms(viewer)
+    GCodeViewer._update_voxel_uniforms(viewer)
+
+    assert viewer.stockmesh["rotation_mat"] is rot
+    assert viewer.voxelmesh["rotation_mat"] is rot
+
+
+def test_raw_feed_z_max_uses_unrotated_wcs_z():
+    """A-baked display Z is near 0 at A=90; stock estimate must use machine Z."""
+    raw_zs = [10.0] * 2 + [22.0] * 18
+    raw: list[float] = []
+    baked: list[float] = []
+    feeds: list[float] = []
+    for i, z in enumerate(raw_zs):
+        raw.extend((float(i), 0.0, z))
+        baked.extend((float(i), -z, 0.0))
+        feeds.append(1000.0)
+    viewer = _viewer(
+        raw_positions=raw,
+        positions=baked,
+        raw_feed_rates=feeds,
+        z_max_mm=0.0,
+    )
+    assert GCodeViewer.raw_feed_z_max_mm(viewer) == pytest.approx(22.0)

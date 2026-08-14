@@ -14,6 +14,8 @@ from carveracontroller.addons.stock.stock_aabb_mesh import (
     build_box_triangles,
     build_cylinder_edges,
     build_cylinder_triangles,
+    build_x_cylinder_edges,
+    build_x_cylinder_triangles,
 )
 
 
@@ -81,5 +83,32 @@ def test_build_cylinder_edges_counts_and_color():
     # 2 rings + verticals
     assert len(indices) == (2 * segs + verticals) * 2
     assert all(math.isfinite(v) for v in vertices)
+    for i in range(0, len(vertices), FLOATS_PER_VERTEX):
+        assert tuple(vertices[i + 6 : i + 10]) == color
+
+
+def test_build_x_cylinder_triangles_counts_and_extent():
+    color = STOCK_FILL_COLOR
+    segs = DEFAULT_CYLINDER_SEGMENTS
+    vertices, indices = build_x_cylinder_triangles(0, 0, -5, 5, 10, color, segments=segs)
+    assert len(vertices) == (2 * segs + 2 * (1 + segs)) * FLOATS_PER_VERTEX
+    assert len(indices) == (segs * 2 + segs + segs) * 3
+    xs = vertices[0::FLOATS_PER_VERTEX]
+    ys = vertices[1::FLOATS_PER_VERTEX]
+    zs = vertices[2::FLOATS_PER_VERTEX]
+    assert min(xs) == -5 and max(xs) == 5
+    assert min(ys) == pytest.approx(-10)
+    assert max(ys) == pytest.approx(10)
+    assert min(zs) == pytest.approx(-10)
+    assert max(zs) == pytest.approx(10)
+
+
+def test_build_x_cylinder_edges_counts_and_color():
+    color = STOCK_EDGE_COLOR
+    segs = 12
+    verticals = 4
+    vertices, indices = build_x_cylinder_edges(1, 2, 0, 8, 5, color, segments=segs, verticals=verticals)
+    assert len(vertices) == 2 * segs * FLOATS_PER_VERTEX
+    assert len(indices) == (2 * segs + verticals) * 2
     for i in range(0, len(vertices), FLOATS_PER_VERTEX):
         assert tuple(vertices[i + 6 : i + 10]) == color

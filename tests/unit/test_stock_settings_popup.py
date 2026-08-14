@@ -4,8 +4,10 @@ import pytest
 
 from carveracontroller.addons.stock.ui.StockSettingsPopup import (
     StockSettingsPopup,
+    _deref_widget,
     _parse_finite_float,
     _parse_positive_float,
+    _shape_kind_pairs,
 )
 
 
@@ -239,7 +241,6 @@ def test_update_dimension_field_visibility_removes_length_for_cylinder():
 
     assert row_length not in form.children
     assert row_length.parent is None
-    assert txt_length.disabled is True
     assert lbl_width.text == "Diameter (mm)"
     assert form.children == [row_height]
 
@@ -271,8 +272,216 @@ def test_update_dimension_field_visibility_restores_length_for_rectangular():
 
     assert row_length in form.children
     assert form.children.index(row_length) == form.children.index(row_height) + 1
-    assert txt_length.disabled is False
     assert lbl_width.text == "Width (mm)"
+
+
+class _FieldStub:
+    def __init__(self, text="", *, disabled=False, active=False):
+        self.text = text
+        self.disabled = disabled
+        self.active = active
+        self.values = []
+
+
+class _WeakProxyStub:
+    """Stand-in for Kivy ``ids`` WeakProxy: getattr/setattr go through ``__self__``."""
+
+    def __init__(self, obj):
+        object.__setattr__(self, "_obj", obj)
+
+    @property
+    def __self__(self):
+        obj = object.__getattribute__(self, "_obj")
+        if obj is None:
+            raise ReferenceError("weakly-referenced object no longer exists")
+        return obj
+
+    def __getattr__(self, name):
+        return getattr(self.__self__, name)
+
+    def __setattr__(self, name, value):
+        setattr(self.__self__, name, value)
+
+
+def test_deref_widget_unwraps_self():
+    real = _FieldStub("axis")
+    proxy = _WeakProxyStub(real)
+    assert _deref_widget(proxy) is real
+    assert _deref_widget(real) is real
+    object.__setattr__(proxy, "_obj", None)
+    assert _deref_widget(proxy) is None
+
+
+def test_pin_detachable_rows_stores_row_referent_not_proxy():
+    popup = StockSettingsPopup.__new__(StockSettingsPopup)
+    real = _RowStub()
+    popup.ids = {"row_z_ref": _WeakProxyStub(real), "row_length": _RowStub()}
+    popup._pin_detachable_rows()
+    assert popup._pinned_row_z_ref is real
+    object.__setattr__(popup.ids["row_z_ref"], "_obj", None)
+    assert popup._row("row_z_ref") is real
+
+
+def test_write_settings_skips_detached_z_ref_spinner():
+    """Dismiss must not touch Origin Z after rotary mode has removed that row."""
+    popup = StockSettingsPopup.__new__(StockSettingsPopup)
+    popup.rotary_mode = True
+    popup._shape_pairs = [("Rectangular", "rectangular"), ("Cylinder", "rotary_cylindrical")]
+    popup._corner_pairs = [("X min (left end)", "BL")]
+    popup._z_pairs = [("Axis center (Z0 = A axis)", "center")]
+    popup._voxel_resolution_pairs = [("Low", "low")]
+    popup._checkpoint_level_pairs = [("Low", "low")]
+    popup._fit_event = None
+    popup._schedule_fit_popup_height = lambda *_a: None
+
+    row_z_ref = _RowStub()
+    row_corner = _RowStub()
+    row_height = _RowStub()
+    form = _FormStub([row_height, row_z_ref, row_corner])
+    row_z_ref.parent = form
+    row_corner.parent = form
+    row_height.parent = form
+    spn_z_ref = _FieldStub("Top")
+    proxy = _WeakProxyStub(spn_z_ref)
+    popup.ids = {
+        "dim_form": form,
+        "row_z_ref": row_z_ref,
+        "row_corner": row_corner,
+        "row_height": row_height,
+        "lbl_corner": _FieldStub("WCS origin"),
+        "txt_width": _FieldStub("50"),
+        "txt_height": _FieldStub("10"),
+        "txt_offset_x": _FieldStub("0"),
+        "txt_offset_y": _FieldStub("0"),
+        "txt_offset_z": _FieldStub("0"),
+        "spn_shape": _FieldStub("Cylinder"),
+        "spn_corner": _FieldStub("X min (left end)"),
+        "spn_z_ref": proxy,
+        "spn_voxel_resolution": _FieldStub("Low"),
+        "spn_checkpoint_level": _FieldStub("Low"),
+        "chk_show_stock": _FieldStub(active=False),
+        "chk_simulate": _FieldStub(active=False),
+        "lbl_width": _FieldStub("Width (mm)"),
+        "lbl_height": _FieldStub("Height (mm)"),
+    }
+    popup._pinned_row_z_ref = row_z_ref
+
+    popup._update_rotary_origin_visibility()
+    assert row_z_ref not in form.children
+    object.__setattr__(proxy, "_obj", None)
+
+    popup._write_settings_to_ui(
+        {
+            "shape": {"kind": "rotary_cylindrical", "diameter_mm": 44, "length_mm": 70},
+            "origin": {"xy_corner": "BL", "z_reference": "center"},
+            "show_stock": False,
+            "simulate_cut": False,
+            "voxel_resolution": "low",
+            "checkpoint_level": "low",
+        }
+    )
+
+    assert spn_z_ref.text == "Top"
+    assert popup.ids["txt_width"].text == "44"
+    assert popup.ids["txt_height"].text == "70"
+
+
+def test_write_settings_skips_detached_length_field():
+    """Dismiss must not touch Length after cylinder mode has removed that row."""
+    popup = StockSettingsPopup.__new__(StockSettingsPopup)
+    popup.rotary_mode = False
+    popup._shape_pairs = [("Rectangular", "rectangular"), ("Cylinder", "cylindrical")]
+    popup._corner_pairs = [("BL", "BL")]
+    popup._z_pairs = [("Top", "top")]
+    popup._voxel_resolution_pairs = [("Low", "low")]
+    popup._checkpoint_level_pairs = [("Low", "low")]
+    popup._fit_event = None
+    popup._schedule_fit_popup_height = lambda *_a: None
+
+    row_length = _RowStub()
+    row_height = _RowStub()
+    row_z_ref = _RowStub()
+    form = _FormStub([row_height, row_length, row_z_ref])
+    row_length.parent = form
+    row_height.parent = form
+    row_z_ref.parent = form
+    txt_length = _FieldStub("100")
+    popup.ids = {
+        "dim_form": form,
+        "row_length": row_length,
+        "row_height": row_height,
+        "row_z_ref": row_z_ref,
+        "row_corner": _RowStub(),
+        "txt_length": txt_length,
+        "txt_width": _FieldStub("50"),
+        "txt_height": _FieldStub("10"),
+        "txt_offset_x": _FieldStub("0"),
+        "txt_offset_y": _FieldStub("0"),
+        "txt_offset_z": _FieldStub("0"),
+        "spn_shape": _FieldStub("Cylinder"),
+        "spn_corner": _FieldStub("BL"),
+        "spn_z_ref": _FieldStub("Top"),
+        "spn_voxel_resolution": _FieldStub("Low"),
+        "spn_checkpoint_level": _FieldStub("Low"),
+        "chk_show_stock": _FieldStub(active=False),
+        "chk_simulate": _FieldStub(active=False),
+        "lbl_width": _FieldStub("Width (mm)"),
+        "lbl_height": _FieldStub("Height (mm)"),
+        "lbl_corner": _FieldStub("WCS origin"),
+    }
+    popup._pinned_row_length = row_length
+    popup._pinned_row_z_ref = row_z_ref
+
+    popup._update_dimension_field_visibility()
+    assert row_length not in form.children
+
+    popup._write_settings_to_ui(
+        {
+            "shape": {"kind": "cylindrical", "diameter_mm": 20, "height_mm": 40},
+            "origin": {"xy_corner": "BL", "z_reference": "top"},
+            "show_stock": False,
+            "simulate_cut": False,
+            "voxel_resolution": "low",
+            "checkpoint_level": "low",
+        }
+    )
+
+    assert txt_length.text == "100"
+    assert popup.ids["txt_height"].text == "40"
+    assert popup.ids["txt_width"].text == "20"
+
+
+def test_update_rotary_origin_visibility_removes_z_ref_row():
+    popup = StockSettingsPopup.__new__(StockSettingsPopup)
+    popup.rotary_mode = True
+    popup._fit_event = None
+    popup._schedule_fit_popup_height = lambda *_a: None
+
+    row_z_ref = _RowStub()
+    row_corner = _RowStub()
+    form = _FormStub([row_z_ref, row_corner])
+    row_z_ref.parent = form
+    row_corner.parent = form
+    lbl_corner = _FieldStub("WCS origin")
+    popup.ids = {
+        "dim_form": form,
+        "row_z_ref": row_z_ref,
+        "row_corner": row_corner,
+        "lbl_corner": lbl_corner,
+        "spn_z_ref": _FieldStub("Top"),
+    }
+
+    popup._update_rotary_origin_visibility()
+
+    assert row_z_ref not in form.children
+    assert lbl_corner.text == "Origin X"
+
+
+def test_shape_kind_pairs_rotary_maps_cylinder_to_x_axis_bar():
+    mill_kinds = [val for _lab, val in _shape_kind_pairs(rotary=False)]
+    rotary_kinds = [val for _lab, val in _shape_kind_pairs(rotary=True)]
+    assert mill_kinds == ["rectangular", "cylindrical"]
+    assert rotary_kinds == ["rectangular", "rotary_cylindrical"]
 
 
 class _SizedStub:

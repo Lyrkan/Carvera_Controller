@@ -16,9 +16,10 @@ from carveracontroller.addons.facing.stock_geometry import (
 
 Z_TOP = "top"
 Z_BOTTOM = "bottom"
+Z_CENTER = "center"
 
 XY_CORNERS = frozenset({CORNER_BL, CORNER_BR, CORNER_TL, CORNER_TR, CORNER_CENTER})
-Z_REFERENCES = frozenset({Z_TOP, Z_BOTTOM})
+Z_REFERENCES = frozenset({Z_TOP, Z_BOTTOM, Z_CENTER})
 
 
 def _finite_offset(value: Any, name: str) -> float:

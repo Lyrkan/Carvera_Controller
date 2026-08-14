@@ -3575,12 +3575,11 @@ class Makera(RelativeLayout):
         self.facing_popup.open()
 
     def open_stock_settings_popup(self):
-        # Stock preview/simulation is XYZ-only; A-axis toolpaths are unsupported.
-        if App.get_running_app().has_4axis:
-            return
         self._pre_modal_keyboard_jog = self.keyboard_jog_control
         self.toggle_keyboard_jog_control(True)
-        self.stock_settings_popup.open()
+        popup = self.stock_settings_popup
+        popup.rotary_mode = bool(App.get_running_app().has_4axis)
+        popup.open()
 
     def apply_stock_settings(self, settings: dict) -> bool:
         """Push stock settings from the popup into the 3D viewer.
@@ -3595,11 +3594,6 @@ class Makera(RelativeLayout):
         """Apply stock settings on the calling thread (must already be main thread)."""
         if self.gcode_viewer is None:
             return False
-        # Keep stock off for 4th-axis files even if settings somehow request it.
-        if App.get_running_app().has_4axis:
-            settings = dict(settings)
-            settings["show_stock"] = False
-            settings["simulate_cut"] = False
         try:
             bounds = bounds_from_settings(settings)
             simulate = bool(settings.get("simulate_cut", False)) and self.gcode_viewer.simulation_available()
@@ -3634,9 +3628,14 @@ class Makera(RelativeLayout):
         """CAM-header stock if present, otherwise toolpath AABB estimate."""
         metadata = getattr(self, "cam_metadata", None) or CamMetadata.empty()
         viewer = getattr(self, "gcode_viewer", None)
+        app = App.get_running_app()
+        rotary = bool(app is not None and getattr(app, "has_4axis", False))
         feed_z_max_mm = None
-        if viewer is not None and getattr(viewer, "raw_feed_rates", None):
-            feed_z_max_mm = float(getattr(viewer, "z_max_mm", 0.0))
+        if viewer is not None:
+            if rotary:
+                feed_z_max_mm = viewer.raw_feed_z_max_mm()
+            elif getattr(viewer, "raw_feed_rates", None):
+                feed_z_max_mm = float(getattr(viewer, "z_max_mm", 0.0))
         return auto_stock_for_loaded_file(
             metadata.stock,
             CNC.vars["xmin"],
@@ -3648,6 +3647,7 @@ class Makera(RelativeLayout):
             tool_table=self.tool_table,
             unit_scale=unit_scale_to_mm(self.document_unit),
             feed_z_max_mm=feed_z_max_mm,
+            rotary=rotary,
         )
 
     @mainthread
@@ -7791,11 +7791,6 @@ class Makera(RelativeLayout):
         if app.has_4axis:
             self.coord_popup.set_config("leveling", "active", False)
             self.coord_popup.set_config("origin", "anchor", 3)
-            # Stock is XYZ-only; drop any preview/simulation for rotary files.
-            popup = getattr(self, "stock_settings_popup", None)
-            if popup is not None:
-                popup.dismiss()
-            self._reset_stock_settings()
         else:
             if (CNC.vars["wcox"] - CNC.vars["anchor1_x"] - CNC.vars["anchor2_offset_x"]) >= 0 and (
                 CNC.vars["wcoy"] - CNC.vars["anchor1_y"] - CNC.vars["anchor2_offset_y"]
@@ -7803,8 +7798,11 @@ class Makera(RelativeLayout):
                 self.coord_popup.set_config("origin", "anchor", 2)
             else:
                 self.coord_popup.set_config("origin", "anchor", 1)
-            shape, origin = self._auto_stock_shape_origin()
-            self._reset_stock_settings(shape=shape, origin=origin)
+        shape, origin = self._auto_stock_shape_origin()
+        popup = getattr(self, "stock_settings_popup", None)
+        if popup is not None:
+            popup.rotary_mode = bool(app.has_4axis)
+        self._reset_stock_settings(shape=shape, origin=origin)
         self.coord_popup.load_config()
 
         self.file_popup.dismiss()

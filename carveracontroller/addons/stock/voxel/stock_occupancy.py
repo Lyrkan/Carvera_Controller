@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 
 from carveracontroller.addons.stock.stock_geometry import contains_wcs
-from carveracontroller.addons.stock.stock_shape import CylindricalStock, RectangularStock, StockShape
+from carveracontroller.addons.stock.stock_shape import (
+    CylindricalStock,
+    RectangularStock,
+    RotaryCylindricalStock,
+    StockShape,
+)
 
 from .voxel_grid import ChunkCoord, ChunkedVoxelGrid
 
@@ -18,6 +23,8 @@ def seed_shape_occupancy(grid: ChunkedVoxelGrid, shape: StockShape | None) -> se
     """
     if shape is None or isinstance(shape, RectangularStock):
         return set()
+    if isinstance(shape, RotaryCylindricalStock):
+        return _seed_x_cylinder(grid, shape)
     if isinstance(shape, CylindricalStock):
         return _seed_cylinder(grid, shape)
     # Unknown shapes: fall back to per-voxel contains_wcs over the AABB.
@@ -35,6 +42,24 @@ def _seed_cylinder(grid: ChunkedVoxelGrid, shape: CylindricalStock) -> set[tuple
         if arr is None:
             continue
         solid = _cylinder_solid_mask(grid, coord, cx, cy, r2)
+        arr[:] = 0
+        arr[solid] = 1
+        grid.maybe_collapse_chunk(coord, arr)
+        dirty.add(coord.as_tuple())
+    return dirty
+
+
+def _seed_x_cylinder(grid: ChunkedVoxelGrid, shape: RotaryCylindricalStock) -> set[tuple[int, int, int]]:
+    bounds = grid.bounds
+    _cx, cy, cz = bounds.center
+    r = 0.5 * float(shape.diameter_mm)
+    r2 = r * r
+    dirty: set[tuple[int, int, int]] = set()
+    for coord in _all_chunk_coords(grid):
+        arr = grid.get_or_create_chunk(coord)
+        if arr is None:
+            continue
+        solid = _x_cylinder_solid_mask(grid, coord, cy, cz, r2)
         arr[:] = 0
         arr[solid] = 1
         grid.maybe_collapse_chunk(coord, arr)
@@ -87,6 +112,27 @@ def _cylinder_solid_mask(
     dx2 = (wx[:, None, None] - cx) ** 2
     dy2 = (wy[None, :, None] - cy) ** 2
     inside = (dx2 + dy2) <= r2
+    return valid & inside
+
+
+def _x_cylinder_solid_mask(
+    grid: ChunkedVoxelGrid,
+    coord: ChunkCoord,
+    cy: float,
+    cz: float,
+    r2: float,
+) -> np.ndarray:
+    """Boolean (cs,cs,cs) mask: in-bounds voxels whose YZ center is inside the circle."""
+    cs = grid.chunk_size
+    valid = grid._valid_mask(coord)
+    iy0 = coord.cy * cs
+    iz0 = coord.cz * cs
+    lx = np.arange(cs, dtype=np.float64)
+    wy = grid.bounds.min_y + (iy0 + lx + 0.5) * grid.voxel_size
+    wz = grid.bounds.min_z + (iz0 + lx + 0.5) * grid.voxel_size
+    dy2 = (wy[None, :, None] - cy) ** 2
+    dz2 = (wz[None, None, :] - cz) ** 2
+    inside = (dy2 + dz2) <= r2
     return valid & inside
 
 

@@ -18,8 +18,13 @@ from carveracontroller.addons.stock.stock_defaults import (
     default_settings,
 )
 from carveracontroller.addons.stock.stock_geometry import compute_wcs_bounds, contains_wcs
-from carveracontroller.addons.stock.stock_origin import Z_BOTTOM, Z_TOP, StockOrigin
-from carveracontroller.addons.stock.stock_shape import CylindricalStock, RectangularStock, shape_from_dict
+from carveracontroller.addons.stock.stock_origin import Z_BOTTOM, Z_CENTER, Z_TOP, StockOrigin
+from carveracontroller.addons.stock.stock_shape import (
+    CylindricalStock,
+    RectangularStock,
+    RotaryCylindricalStock,
+    shape_from_dict,
+)
 
 
 def test_rectangular_local_bounds():
@@ -211,3 +216,45 @@ def test_bounds_from_cylindrical_settings():
     assert (bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y) == (-25.0, -25.0, 25.0, 25.0)
     assert bounds.min_z == -10.0
     assert bounds.max_z == 0.0
+
+
+def test_wcs_bounds_z_center_centers_y_and_z():
+    shape = RectangularStock(80, 40, 20)
+    origin = StockOrigin(xy_corner=CORNER_BL, z_reference=Z_CENTER)
+    bounds = compute_wcs_bounds(shape, origin)
+    assert (bounds.min_x, bounds.max_x) == (0.0, 80.0)
+    assert bounds.min_y == pytest.approx(-20.0)
+    assert bounds.max_y == pytest.approx(20.0)
+    assert bounds.min_z == pytest.approx(-10.0)
+    assert bounds.max_z == pytest.approx(10.0)
+
+
+def test_rotary_cylinder_wcs_bounds_on_axis():
+    shape = RotaryCylindricalStock(diameter_mm=44, length_mm=70)
+    origin = StockOrigin(xy_corner=CORNER_BL, z_reference=Z_CENTER, offset_x_mm=6.0)
+    bounds = compute_wcs_bounds(shape, origin)
+    assert bounds.min_x == pytest.approx(6.0)
+    assert bounds.max_x == pytest.approx(76.0)
+    assert bounds.min_y == pytest.approx(-22.0)
+    assert bounds.max_y == pytest.approx(22.0)
+    assert bounds.min_z == pytest.approx(-22.0)
+    assert bounds.max_z == pytest.approx(22.0)
+    assert contains_wcs(shape, bounds, 10.0, 0.0, 0.0)
+    assert contains_wcs(shape, bounds, 10.0, 0.0, 21.0)
+    assert not contains_wcs(shape, bounds, 10.0, 21.0, 21.0)
+
+
+def test_rotary_cylinder_roundtrip_dict():
+    shape = RotaryCylindricalStock(diameter_mm=30.5, length_mm=120)
+    restored = shape_from_dict(shape.to_dict())
+    assert isinstance(restored, RotaryCylindricalStock)
+    assert restored.diameter_mm == 30.5
+    assert restored.length_mm == 120
+
+
+def test_rotate_yz_quarter_turn():
+    from carveracontroller.addons.stock.stock_geometry import rotate_yz
+
+    y, z = rotate_yz(0.0, 10.0, 90.0)
+    assert y == pytest.approx(-10.0)
+    assert z == pytest.approx(0.0)

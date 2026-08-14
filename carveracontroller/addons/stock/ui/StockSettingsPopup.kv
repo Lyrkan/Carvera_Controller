@@ -131,6 +131,7 @@
                         height: dp(40)
                         spacing: dp(8)
                         Label:
+                            id: lbl_height
                             text: tr._('Height (mm)')
                             size_hint_x: LABEL_W
                             text_size: self.size
@@ -144,10 +145,12 @@
                             size_hint_x: FIELD_W
 
                     BoxLayout:
+                        id: row_corner
                         size_hint_y: None
                         height: dp(40)
                         spacing: dp(8)
                         Label:
+                            id: lbl_corner
                             text: tr._('WCS origin')
                             size_hint_x: LABEL_W
                             text_size: self.size
@@ -160,10 +163,12 @@
                             size_hint_x: FIELD_W
 
                     BoxLayout:
+                        id: row_z_ref
                         size_hint_y: None
                         height: dp(40)
                         spacing: dp(8)
                         Label:
+                            id: lbl_z_ref
                             text: tr._('Origin Z')
                             size_hint_x: LABEL_W
                             text_size: self.size

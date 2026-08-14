@@ -25,8 +25,8 @@ void main()
     vec4 eye_pos = view_mat * world;
     normal_vec = (view_mat * rotation_mat * vec4(v_normal, 0.0)).xyz;
     voxel_color = v_color;
-    // Height tint uses viewer-scaled Z so it matches stock_z_min / stock_z_max.
-    world_z = scaled_pos.z;
+    // Height tint after A rotation so "up" stays machine Z, not stock-local Z.
+    world_z = rotated.z;
     tex_coord0 = vec2(0.0);
     gl_Position = proj_mat * eye_pos;
 }

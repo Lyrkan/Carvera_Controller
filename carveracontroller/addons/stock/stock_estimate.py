@@ -12,9 +12,9 @@ from carveracontroller.CNC import (
     is_probe_tools_range,
 )
 
-from .stock_defaults import default_origin, default_shape
-from .stock_origin import Z_TOP, StockOrigin
-from .stock_shape import RectangularStock, StockShape, shape_from_dict
+from .stock_defaults import default_origin, default_rotary_origin, default_rotary_shape, default_shape
+from .stock_origin import Z_CENTER, Z_TOP, StockOrigin
+from .stock_shape import RectangularStock, RotaryCylindricalStock, StockShape, shape_from_dict
 
 # RectangularStock requires strictly positive extents.
 _MIN_EXTENT_MM = 1e-6
@@ -90,6 +90,57 @@ def estimate_rectangular_stock(
     return shape, origin
 
 
+def estimate_rotary_stock(
+    xmin: float,
+    ymin: float,
+    zmin: float,
+    xmax: float,
+    ymax: float,
+    zmax: float,
+    pad_xy_mm: float = 0.0,
+    *,
+    kind: str = RotaryCylindricalStock.kind,
+) -> tuple[StockShape, StockOrigin] | None:
+    """Build axis-centered rotary stock, mirrored about Y=Z=0.
+
+    Cutting Z is typically the +Z (top) side of the bar; the far side is
+    assumed symmetric about the A axis. Extents snap outward to whole millimetres.
+
+    Returns ``None`` when the AABB is empty (no cutting moves).
+    """
+    if xmin > xmax or ymin > ymax or zmin > zmax:
+        return None
+
+    pad = max(float(pad_xy_mm), 0.0)
+    min_x = math.floor(xmin - pad)
+    max_x = math.ceil(xmax + pad)
+    length = max(max_x - min_x, _MIN_EXTENT_MM)
+
+    max_abs_y = max(abs(ymin), abs(ymax))
+    max_abs_z = max(abs(zmin), abs(zmax))
+    # Radial pad (tool radius) so the bar encloses the cutter at the surface.
+    radius = math.hypot(max_abs_y, max_abs_z) + pad
+    diameter = max(2.0 * math.ceil(radius), _MIN_EXTENT_MM)
+
+    height = max(2.0 * math.ceil(max_abs_z + pad), _MIN_EXTENT_MM)
+    width_y = max(2.0 * math.ceil(max_abs_y + pad), _MIN_EXTENT_MM)
+    if max_abs_y < _MIN_EXTENT_MM:
+        width_y = height
+
+    origin = StockOrigin(
+        xy_corner=CORNER_BL,
+        z_reference=Z_CENTER,
+        offset_x_mm=min_x,
+        offset_y_mm=0.0,
+        offset_z_mm=0.0,
+    )
+    if kind == "rectangular":
+        shape: StockShape = RectangularStock(width_mm=length, length_mm=width_y, height_mm=height)
+    else:
+        shape = RotaryCylindricalStock(diameter_mm=diameter, length_mm=length)
+    return shape, origin
+
+
 def shape_and_origin_from_cam_stock(cam_stock: CamStock) -> tuple[StockShape, StockOrigin]:
     """Convert parsed CAM header stock into the viewer's shape/origin types."""
     return shape_from_dict(cam_stock.to_shape_dict()), StockOrigin.from_dict(cam_stock.to_origin_dict())
@@ -106,9 +157,13 @@ def auto_stock_for_loaded_file(
     tool_table: dict | None = None,
     unit_scale: float = 1.0,
     feed_z_max_mm: float | None = None,
+    rotary: bool = False,
+    rotary_kind: str = RotaryCylindricalStock.kind,
 ) -> tuple[StockShape, StockOrigin]:
     """Prefer CAM-header stock; otherwise estimate from cutting bounds.
-    `feed_z_max_mm` is a guess of the feed Z max value based on P95 of Z values (also used by the color scheme panel).
+
+    ``feed_z_max_mm`` is P95 of feed-move Z (same idea as the colour-scheme
+    panel). For rotary files it must be raw WCS Z, not A-baked display Z.
     If the dimension of the stock can't be guessed fallback to the default values.
     """
     if cam_stock is not None:
@@ -122,6 +177,12 @@ def auto_stock_for_loaded_file(
         zmax_use = min(zmax, float(feed_z_max_mm))
 
     pad_xy_mm = max_cutting_tool_diameter_mm(tool_table or {}, unit_scale) / 2.0
+    if rotary:
+        estimated = estimate_rotary_stock(xmin, ymin, zmin, xmax, ymax, zmax_use, pad_xy_mm, kind=rotary_kind)
+        if estimated is not None:
+            return estimated
+        return default_rotary_shape(), default_rotary_origin()
+
     estimated = estimate_rectangular_stock(xmin, ymin, zmin, xmax, ymax, zmax_use, pad_xy_mm)
     if estimated is not None:
         return estimated

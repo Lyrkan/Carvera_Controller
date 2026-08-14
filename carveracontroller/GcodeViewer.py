@@ -64,10 +64,12 @@ from .addons.stock.stock_aabb_mesh import (
     build_box_triangles,
     build_cylinder_edges,
     build_cylinder_triangles,
+    build_x_cylinder_edges,
+    build_x_cylinder_triangles,
 )
 from .addons.stock.stock_defaults import default_bounds, default_shape
 from .addons.stock.stock_geometry import StockBounds
-from .addons.stock.stock_shape import CylindricalStock, RectangularStock, StockShape
+from .addons.stock.stock_shape import CylindricalStock, RectangularStock, RotaryCylindricalStock, StockShape
 from .addons.stock.voxel.stock_simulator import (
     DEFAULT_MESH_THROTTLE_S,
     PLAY_MESH_THROTTLE_S,
@@ -755,6 +757,7 @@ class GCodeViewer(Widget):
 
         # Pre-computed constant matrices reused every frame to avoid per-frame
         self._identity_mat = Matrix()
+        self._stock_rotation_mat = self._identity_mat
         self._axis_y_rot = Matrix().rotate(0.5 * math.pi, 1, 0, 0)
         self._axis_z_rot = Matrix().rotate(-0.5 * math.pi, 0, 0, 1)
         self._proj_matrix = Matrix()
@@ -1031,6 +1034,7 @@ class GCodeViewer(Widget):
         self.simulate_cut = False
         self._defer_carved_stock = False
         self._viewer_meshes_active = False
+        self._stock_rotation_mat = self._identity_mat
         if self._stock_simulator is not None:
             # Keep bounds/shape/quality, but pause carving until the new file finishes loading.
             self._stock_simulator.clear_toolpath()
@@ -1766,6 +1770,19 @@ class GCodeViewer(Widget):
         self.linemesh["z_min"] = float(self.z_min)
         self.linemesh["z_max"] = float(self.z_max)
 
+    def raw_feed_z_max_mm(self) -> float | None:
+        """P95 of feed-move Z in raw WCS millimetres (not A-baked display XYZ).
+
+        ``z_max_mm`` is computed from display ``positions``, which already have
+        A baked in. Rotary stock estimate must cap against machine Z instead.
+        """
+        positions = getattr(self, "raw_positions", None) or []
+        feeds = getattr(self, "raw_feed_rates", None) or []
+        if not positions or not feeds:
+            return None
+        _z_min, z_max = _feed_z_height_range_mm(positions, feeds)
+        return float(z_max)
+
     def set_color_scheme(self, scheme):
         """Set toolpath color scheme from UI label or internal id."""
         if scheme in (COLOR_SCHEME_UI_BY_TOOL, "by_tool", COLOR_SCHEME_BY_TOOL):
@@ -1927,7 +1944,15 @@ class GCodeViewer(Widget):
         x1, y1, z1 = self._mm_to_viewer(b.max_x, b.max_y, b.max_z)
 
         shape = self.stock_shape
-        if isinstance(shape, CylindricalStock):
+        if isinstance(shape, RotaryCylindricalStock):
+            cy = 0.5 * (y0 + y1)
+            cz = 0.5 * (z0 + z1)
+            radius = 0.5 * min(abs(y1 - y0), abs(z1 - z0))
+            edge_verts, edge_idx = build_x_cylinder_edges(cy, cz, x0, x1, radius, STOCK_EDGE_COLOR)
+            fill_verts = fill_idx = None
+            if not self._carved_stock_visible():
+                fill_verts, fill_idx = build_x_cylinder_triangles(cy, cz, x0, x1, radius, STOCK_FILL_COLOR)
+        elif isinstance(shape, CylindricalStock):
             cx = 0.5 * (x0 + x1)
             cy = 0.5 * (y0 + y1)
             radius = 0.5 * min(abs(x1 - x0), abs(y1 - y0))
@@ -1974,12 +1999,18 @@ class GCodeViewer(Widget):
         glDepthMask(GL_TRUE)
         self.stockmesh["use_lighting"] = 0.0
 
+    def _set_stock_rotation_mat(self, mat) -> None:
+        """Keep preview and voxel stock spinning with 4-axis playback."""
+        self._stock_rotation_mat = mat
+        self.stockmesh["rotation_mat"] = mat
+        self.voxelmesh["rotation_mat"] = mat
+
     def _update_stock_uniforms(self) -> None:
         center = getattr(self, "lines_center", [0.0, 0.0, 0.0])
         self.stockmesh["center_offset"] = Matrix().translate(-center[0], -center[1], -center[2])
         self.stockmesh["view_mat"] = self.m_viewMatrix
         self.stockmesh["proj_mat"] = self._proj_matrix
-        self.stockmesh["rotation_mat"] = self._identity_mat
+        self.stockmesh["rotation_mat"] = self._stock_rotation_mat
         self.stockmesh["use_lighting"] = 1.0
 
     def _update_voxel_uniforms(self) -> None:
@@ -1987,7 +2018,7 @@ class GCodeViewer(Widget):
         self.voxelmesh["center_offset"] = Matrix().translate(-center[0], -center[1], -center[2])
         self.voxelmesh["view_mat"] = self.m_viewMatrix
         self.voxelmesh["proj_mat"] = self._proj_matrix
-        self.voxelmesh["rotation_mat"] = self._identity_mat
+        self.voxelmesh["rotation_mat"] = self._stock_rotation_mat
         self.voxelmesh["vertex_scale"] = self._stock_scale()
         # Height tint range in the same viewer-scaled space as mesh vertex Z.
         bounds = self.stock_bounds_mm
@@ -2194,6 +2225,7 @@ class GCodeViewer(Widget):
             self.raw_tools,
             self.tool_table,
             tool_scale=float(self.tool_unit_scale or 1.0),
+            angles=self.angles_of_vertices,
         )
 
     def _sync_stock_simulation(self, current_vertex: int) -> None:
@@ -2296,7 +2328,9 @@ class GCodeViewer(Widget):
                     if not self.rotate_line_or_knife:
                         self.pointermesh["rotation"] = rotate_mat_by_x_axis_angle(lerp_angle)
                     else:
-                        self.linemesh["rotation_mat"] = rotate_mat_by_x_axis_angle(-lerp_angle)
+                        rot = rotate_mat_by_x_axis_angle(-lerp_angle)
+                        self.linemesh["rotation_mat"] = rot
+                        self._set_stock_rotation_mat(rot)
                         len_to_center = len_2d(
                             [lerp_pos[1], lerp_pos[2]], [-self.lines_center[1], -self.lines_center[2]]
                         )
@@ -2308,9 +2342,9 @@ class GCodeViewer(Widget):
                     if not self.rotate_line_or_knife:
                         self.pointermesh["rotation"] = rotate_mat_by_x_axis_angle(last_angle)
                     else:
-                        self.linemesh["view_mat"] = self.linemesh["view_mat"].multiply(
-                            rotate_mat_by_x_axis_angle(-last_angle)
-                        )
+                        rot = rotate_mat_by_x_axis_angle(-last_angle)
+                        self.linemesh["view_mat"] = self.linemesh["view_mat"].multiply(rot)
+                        self._set_stock_rotation_mat(rot)
 
                         len_to_center = len_3d(last_pos, [-self.lines_center[0], -self.lines_center[1], 0])
                         self.pointermesh["offset"] = [

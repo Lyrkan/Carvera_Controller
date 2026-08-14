@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from carveracontroller.addons.facing.stock_geometry import stock_rect_from_origin_corner
 
-from .stock_origin import Z_BOTTOM, Z_TOP, StockOrigin
+from .stock_origin import Z_BOTTOM, Z_CENTER, Z_TOP, StockOrigin
 from .stock_shape import StockShape
 
 
@@ -38,6 +39,17 @@ class StockBounds:
         )
 
 
+def rotate_yz(y: float, z: float, angle_deg: float) -> tuple[float, float]:
+    """Rotate ``(y, z)`` around X by *angle_deg* (right-hand, degrees).
+
+    Matches the G-code viewer's ``rotate_pt_by_x_axis_angle`` YZ mapping.
+    """
+    rad = math.radians(float(angle_deg))
+    c = math.cos(rad)
+    s = math.sin(rad)
+    return (y * c - z * s, y * s + z * c)
+
+
 def compute_wcs_bounds(shape: StockShape, origin: StockOrigin) -> StockBounds:
     """Map a local stock shape into WCS using the given origin placement."""
     (_min_local, (dx, dy, dz)) = shape.local_bounds()
@@ -50,6 +62,13 @@ def compute_wcs_bounds(shape: StockShape, origin: StockOrigin) -> StockBounds:
     elif origin.z_reference == Z_BOTTOM:
         min_z = 0.0
         max_z = dz
+    elif origin.z_reference == Z_CENTER:
+        # Rotary: Z0 on the A axis; Y is also centered on the axis. xy_corner
+        # still places X (min / max / center).
+        min_y = -0.5 * dy
+        max_y = 0.5 * dy
+        min_z = -0.5 * dz
+        max_z = 0.5 * dz
     else:
         raise ValueError(f"unsupported z_reference: {origin.z_reference!r}")
 

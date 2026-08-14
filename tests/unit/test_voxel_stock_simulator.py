@@ -2123,3 +2123,89 @@ def test_display_seek_back_rearms_idle_bake():
         resume.set()
         sim_module.StockSimulator._iter_cut_jobs = original_iter
         sim.stop()
+
+
+def test_a0_zero_matches_upright_carve():
+    tool = _flat_tool()
+    g0 = _small_grid(voxel=0.5)
+    g1 = _small_grid(voxel=0.5)
+    carve_segment_into_grid(g0, (-3.0, 0.0, -1.0), (3.0, 0.0, -1.0), tool)
+    carve_segment_into_grid(g1, (-3.0, 0.0, -1.0), (3.0, 0.0, -1.0), tool, a0=0.0, a1=0.0)
+    assert g0.is_solid_at_world(0.0, 0.0, -0.75) == g1.is_solid_at_world(0.0, 0.0, -0.75)
+    assert g0.is_solid_at_world(0.0, 4.0, -1.0) == g1.is_solid_at_world(0.0, 4.0, -1.0)
+
+
+def test_indexed_a90_clears_side_not_top():
+    from carveracontroller.addons.stock.stock_geometry import rotate_yz
+
+    bounds = StockBounds(min_x=0, min_y=-14, min_z=-14, max_x=40, max_y=14, max_z=14)
+    grid = ChunkedVoxelGrid(bounds, voxel_size_mm=0.5, chunk_size=8)
+    tool = _flat_tool(diameter=6.0, flute_length=8.0)
+    # Machine tip at Z=8; a point 2 mm up the flute is unambiguously inside.
+    carve_segment_into_grid(grid, (20.0, 0.0, 8.0), (20.0, 0.0, 8.0), tool, a0=90.0, a1=90.0)
+    y, z = rotate_yz(0.0, 10.0, 90.0)
+    assert not grid.is_solid_at_world(20.0, y, z)
+    assert grid.is_solid_at_world(20.0, 0.0, 10.0)
+
+
+def test_wrapping_a_clears_arc():
+    from carveracontroller.addons.stock.stock_geometry import rotate_yz
+
+    bounds = StockBounds(min_x=0, min_y=-14, min_z=-14, max_x=40, max_y=14, max_z=14)
+    grid = ChunkedVoxelGrid(bounds, voxel_size_mm=0.5, chunk_size=8)
+    tool = _flat_tool(diameter=6.0, flute_length=8.0)
+    carve_segment_into_grid(grid, (20.0, 0.0, 8.0), (20.0, 0.0, 8.0), tool, a0=0.0, a1=90.0)
+    assert not grid.is_solid_at_world(20.0, 0.0, 10.0)
+    y, z = rotate_yz(0.0, 10.0, 90.0)
+    assert not grid.is_solid_at_world(20.0, y, z)
+
+
+def test_iter_cut_jobs_merges_a_only_wrap():
+    from carveracontroller.addons.stock.voxel.stock_simulator import CheckpointStore, PathSnapshot, StockSimulator
+
+    tool = _flat_tool()
+    n = 10
+    positions: list[float] = []
+    angles: list[float] = []
+    for i in range(n):
+        positions.extend((20.0, 0.0, 8.0))
+        angles.append(float(i * 5.0))
+    path = PathSnapshot(
+        positions,
+        [2.0] + [1.0] * (n - 1),
+        [1] * n,
+        {1: tool},
+        tool_scale=1.0,
+        angles=angles,
+    )
+    store = CheckpointStore(slot_count=1)
+    store.set_path_vertex_count(n)
+    sim = StockSimulator()
+    try:
+        jobs = list(sim._iter_cut_jobs(path, 0, n - 1, voxel_size_mm=1.0, checkpoints=store))
+        assert len(jobs) == 1
+        assert jobs[0].a0 == pytest.approx(0.0)
+        assert jobs[0].a1 == pytest.approx(45.0)
+        assert jobs[0].p0 == (20.0, 0.0, 8.0)
+        assert jobs[0].p1 == (20.0, 0.0, 8.0)
+    finally:
+        sim.stop()
+
+
+def test_reset_seeds_rotary_cylindrical_occupancy():
+    from carveracontroller.addons.facing.stock_geometry import CORNER_BL
+    from carveracontroller.addons.stock.stock_geometry import compute_wcs_bounds
+    from carveracontroller.addons.stock.stock_origin import Z_CENTER, StockOrigin
+    from carveracontroller.addons.stock.stock_shape import RotaryCylindricalStock
+    from carveracontroller.addons.stock.voxel.stock_simulator import StockSimulator
+
+    shape = RotaryCylindricalStock(diameter_mm=40, length_mm=80)
+    bounds = compute_wcs_bounds(shape, StockOrigin(xy_corner=CORNER_BL, z_reference=Z_CENTER))
+    sim = StockSimulator()
+    try:
+        sim.reset(bounds, enable=True, voxel_size_mm=2.0, shape=shape)
+        assert sim.grid is not None
+        assert sim.grid.is_solid_at_world(40.0, 0.0, 0.0)
+        assert not sim.grid.is_solid_at_world(40.0, 19.0, 19.0)
+    finally:
+        sim.stop()

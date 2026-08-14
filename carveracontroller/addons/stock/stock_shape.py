@@ -122,9 +122,55 @@ class CylindricalStock(StockShape):
         )
 
 
+@dataclass(frozen=True)
+class RotaryCylindricalStock(StockShape):
+    """X-axis cylindrical bar (round stock in a 4th-axis rotary).
+
+    Dimensions are in millimetres:
+    - ``length_mm``    -> X extent (along the A / rotation axis)
+    - ``diameter_mm``  -> Y and Z extent of the bounding square
+    """
+
+    kind: ClassVar[str] = "rotary_cylindrical"
+
+    diameter_mm: float
+    length_mm: float
+
+    def __post_init__(self) -> None:
+        if self.diameter_mm <= 0 or self.length_mm <= 0:
+            raise ValueError("RotaryCylindricalStock dimensions must be positive")
+
+    def local_bounds(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        d = self.diameter_mm
+        return (0.0, 0.0, 0.0), (self.length_mm, d, d)
+
+    def contains_local(self, x: float, y: float, z: float) -> bool:
+        if not (0.0 <= x <= self.length_mm):
+            return False
+        r = 0.5 * self.diameter_mm
+        dy = y - r
+        dz = z - r
+        return (dy * dy + dz * dz) <= (r * r)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "diameter_mm": float(self.diameter_mm),
+            "length_mm": float(self.length_mm),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RotaryCylindricalStock:
+        return cls(
+            diameter_mm=float(data["diameter_mm"]),
+            length_mm=float(data["length_mm"]),
+        )
+
+
 _SHAPE_REGISTRY: dict[str, type[StockShape]] = {
     RectangularStock.kind: RectangularStock,
     CylindricalStock.kind: CylindricalStock,
+    RotaryCylindricalStock.kind: RotaryCylindricalStock,
 }
 
 

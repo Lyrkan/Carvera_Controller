@@ -12,12 +12,13 @@ from carveracontroller.addons.stock.stock_defaults import (
 from carveracontroller.addons.stock.stock_estimate import (
     auto_stock_for_loaded_file,
     estimate_rectangular_stock,
+    estimate_rotary_stock,
     max_cutting_tool_diameter_mm,
     shape_and_origin_from_cam_stock,
 )
 from carveracontroller.addons.stock.stock_geometry import compute_wcs_bounds
-from carveracontroller.addons.stock.stock_origin import Z_TOP
-from carveracontroller.addons.stock.stock_shape import CylindricalStock, RectangularStock
+from carveracontroller.addons.stock.stock_origin import Z_CENTER, Z_TOP
+from carveracontroller.addons.stock.stock_shape import CylindricalStock, RectangularStock, RotaryCylindricalStock
 from carveracontroller.addons.tool_visualization.tool_definition import ToolDefinition
 from carveracontroller.CNC import LASER_TOOL_NUMBER, PROBE_TOOLS_RANGE_START, ZPROBE_TOOL_NUMBER
 
@@ -202,3 +203,52 @@ def test_shape_and_origin_from_cam_cylindrical():
     assert shape.diameter_mm == pytest.approx(50.0)
     assert origin.xy_corner == "center"
     assert origin.z_reference == "bottom"
+
+
+def test_estimate_rotary_cylinder_mirrors_about_axis():
+    # Wrapping: Y=0, feed Z 10..22, X 6..74. Far side is never visited.
+    result = estimate_rotary_stock(6.0, 0.0, 10.0, 74.0, 0.0, 22.0, pad_xy_mm=0.0)
+    assert result is not None
+    shape, origin = result
+    assert isinstance(shape, RotaryCylindricalStock)
+    assert origin.z_reference == Z_CENTER
+    assert origin.xy_corner == CORNER_BL
+    assert origin.offset_x_mm == pytest.approx(6.0)
+    assert origin.offset_y_mm == pytest.approx(0.0)
+    assert origin.offset_z_mm == pytest.approx(0.0)
+    assert shape.length_mm == pytest.approx(68.0)
+    assert shape.diameter_mm == pytest.approx(44.0)
+    bounds = compute_wcs_bounds(shape, origin)
+    assert bounds.min_z == pytest.approx(-22.0)
+    assert bounds.max_z == pytest.approx(22.0)
+    assert bounds.min_y == pytest.approx(-22.0)
+    assert bounds.max_y == pytest.approx(22.0)
+
+
+def test_estimate_rotary_rectangular_square_when_y_is_zero():
+    shape, origin = estimate_rotary_stock(0.0, 0.0, 5.0, 50.0, 0.0, 20.0, pad_xy_mm=0.0, kind="rectangular")
+    assert isinstance(shape, RectangularStock)
+    assert origin.z_reference == Z_CENTER
+    assert shape.width_mm == pytest.approx(50.0)
+    assert shape.height_mm == pytest.approx(40.0)
+    assert shape.length_mm == pytest.approx(40.0)  # square from Z when Y≈0
+    bounds = compute_wcs_bounds(shape, origin)
+    assert bounds.min_z == pytest.approx(-20.0)
+    assert bounds.max_z == pytest.approx(20.0)
+
+
+def test_auto_stock_rotary_uses_feed_z_cap():
+    shape, origin = auto_stock_for_loaded_file(
+        None,
+        0.0,
+        0.0,
+        10.0,
+        80.0,
+        0.0,
+        30.0,
+        feed_z_max_mm=22.0,
+        rotary=True,
+    )
+    assert isinstance(shape, RotaryCylindricalStock)
+    assert origin.z_reference == Z_CENTER
+    assert shape.diameter_mm == pytest.approx(44.0)

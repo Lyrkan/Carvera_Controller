@@ -13,8 +13,8 @@ from .simulation_quality import (
     normalize_voxel_resolution,
 )
 from .stock_geometry import StockBounds, compute_wcs_bounds
-from .stock_origin import Z_TOP, StockOrigin
-from .stock_shape import RectangularStock, StockShape, shape_from_dict
+from .stock_origin import Z_CENTER, Z_TOP, StockOrigin
+from .stock_shape import RectangularStock, RotaryCylindricalStock, StockShape, shape_from_dict
 
 DEFAULT_WIDTH_MM = 100.0
 DEFAULT_LENGTH_MM = 100.0
@@ -32,6 +32,14 @@ def default_shape() -> RectangularStock:
 
 def default_origin() -> StockOrigin:
     return StockOrigin(xy_corner=CORNER_BL, z_reference=Z_TOP)
+
+
+def default_rotary_shape() -> RotaryCylindricalStock:
+    return RotaryCylindricalStock(diameter_mm=DEFAULT_DIAMETER_MM, length_mm=DEFAULT_WIDTH_MM)
+
+
+def default_rotary_origin() -> StockOrigin:
+    return StockOrigin(xy_corner=CORNER_BL, z_reference=Z_CENTER)
 
 
 def default_bounds() -> StockBounds:

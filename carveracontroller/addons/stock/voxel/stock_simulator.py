@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -18,7 +19,7 @@ from carveracontroller.addons.stock.simulation_quality import (
     DEFAULT_VOXEL_RESOLUTION,
     VOXEL_TARGET_BY_LEVEL,
 )
-from carveracontroller.addons.stock.stock_geometry import StockBounds
+from carveracontroller.addons.stock.stock_geometry import StockBounds, rotate_yz
 from carveracontroller.addons.stock.stock_shape import RectangularStock, StockShape
 from carveracontroller.addons.tool_visualization.mesh_builder import (
     effective_tool_diameter,
@@ -65,6 +66,8 @@ _MERGE_TOL_VOXEL_FRAC = 0.25
 _MERGE_MAX_MM_FLOOR = 8.0
 _MERGE_MAX_MM_VOXEL_MULT = 16.0
 _MERGE_MAX_SPAN = 64
+# Subdivide wrapping / helical A so each constant-A carve is a few degrees.
+_MAX_DA_DEG = 2.0
 
 
 def _exterior_chunk_keys(grid: ChunkedVoxelGrid) -> set[tuple[int, int, int]]:
@@ -212,6 +215,8 @@ class CarveJob:
     tool_def: ToolDefinition | None
     is_cut: bool
     end_vertex: int = 0  # path vertex at segment end (checkpoints / seek)
+    a0: float = 0.0
+    a1: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -240,6 +245,7 @@ class PathSnapshot:
     tools: list[int] | None
     tool_table: dict | None
     tool_scale: float = 1.0
+    angles: list[float] | None = None
 
     def vertex_count(self) -> int:
         if not self.positions:
@@ -530,6 +536,7 @@ class StockSimulator:
         self._path_positions: list[float] | None = None
         self._path_vertex_types: list[float] | None = None
         self._path_tools: list[int] | None = None
+        self._path_angles: list[float] | None = None
         self._tool_table: dict | None = None
         self._tool_scale: float = 1.0
         # When False, carve/checkpoint continue but mesh callbacks are skipped.
@@ -724,6 +731,7 @@ class StockSimulator:
         tools: list[int] | None,
         tool_table: dict | None,
         tool_scale: float = 1.0,
+        angles: list[float] | None = None,
     ) -> None:
         """Publish the active toolpath (UI thread). Buffers must stay read-only.
 
@@ -734,6 +742,7 @@ class StockSimulator:
             self._path_positions = positions
             self._path_vertex_types = vertex_types
             self._path_tools = tools
+            self._path_angles = angles
             self._tool_table = tool_table
             self._tool_scale = float(tool_scale) if tool_scale else 1.0
             n = 0 if positions is None else len(positions) // 3
@@ -917,6 +926,7 @@ class StockSimulator:
             tools=self._path_tools,
             tool_table=self._tool_table,
             tool_scale=self._tool_scale,
+            angles=self._path_angles,
         )
 
     def _path_vertex_count_locked(self) -> int:
@@ -982,6 +992,32 @@ class StockSimulator:
         base = idx * 3
         return (float(pos[base]), float(pos[base + 1]), float(pos[base + 2]))
 
+    @staticmethod
+    def _raw_angle(path: PathSnapshot, idx: int) -> float:
+        angs = path.angles
+        if not angs or idx < 0 or idx >= len(angs):
+            return 0.0
+        return float(angs[idx])
+
+    def _carve_job(
+        self,
+        path: PathSnapshot,
+        p0: tuple[float, float, float],
+        p1: tuple[float, float, float],
+        tool_def: ToolDefinition | None,
+        start_idx: int,
+        end_idx: int,
+    ) -> CarveJob:
+        return CarveJob(
+            p0=p0,
+            p1=p1,
+            tool_def=tool_def,
+            is_cut=True,
+            end_vertex=end_idx,
+            a0=self._raw_angle(path, start_idx),
+            a1=self._raw_angle(path, end_idx),
+        )
+
     def _iter_cut_jobs(
         self,
         path: PathSnapshot,
@@ -1027,13 +1063,7 @@ class StockSimulator:
             break_at = checkpoints.next_unrecorded_target()
             # Target already behind this segment: flush one job so recording can catch up.
             if break_at is not None and i > break_at:
-                yield CarveJob(
-                    p0=p0,
-                    p1=p1,
-                    tool_def=tool_def,
-                    is_cut=True,
-                    end_vertex=run_end,
-                )
+                yield self._carve_job(path, p0, p1, tool_def, i - 1, run_end)
                 i = run_end + 1
                 continue
 
@@ -1047,11 +1077,14 @@ class StockSimulator:
                     break
 
                 p_new = self._raw_xyz(path, j)
-                if not _can_extend_collinear_merge(p0, p1, p_new, merge_tol):
+                step = _xyz_dist(p1, p_new)
+                a_only = _xyz_dist(p0, p_new) <= merge_tol and step <= merge_tol
+                if not a_only and not _can_extend_collinear_merge(p0, p1, p_new, merge_tol):
                     break
 
-                step = _xyz_dist(p1, p_new)
-                if path_len + step > max_merge_mm or span + 1 > max_span:
+                if (not a_only) and (path_len + step > max_merge_mm or span + 1 > max_span):
+                    break
+                if a_only and span + 1 > max_span:
                     break
 
                 p1 = p_new
@@ -1063,16 +1096,10 @@ class StockSimulator:
                 if break_at is not None and run_end >= break_at:
                     break
 
-            if run_end > i:
+            if run_end > i and not (_xyz_dist(p0, p1) <= merge_tol):
                 run_end, p1 = _clamp_collinear_run_end(point_at, i, run_end, p0, merge_tol)
 
-            yield CarveJob(
-                p0=p0,
-                p1=p1,
-                tool_def=tool_def,
-                is_cut=True,
-                end_vertex=run_end,
-            )
+            yield self._carve_job(path, p0, p1, tool_def, i - 1, run_end)
             i = run_end + 1
 
     def _rewind_grid_to(
@@ -1502,12 +1529,17 @@ class StockSimulator:
     ) -> set[tuple[int, int, int]]:
         if not job.is_cut:
             return set()
+        kwargs = {}
+        if abs(float(job.a0)) > 1e-9 or abs(float(job.a1)) > 1e-9:
+            kwargs["a0"] = job.a0
+            kwargs["a1"] = job.a1
         return carve_segment_into_grid(
             grid,
             job.p0,
             job.p1,
             job.tool_def,
             tool_unit_scale=tool_unit_scale,
+            **kwargs,
         )
 
 
@@ -1538,6 +1570,29 @@ def _constant_profile_radius(profile_rs: np.ndarray) -> float | None:
     return None
 
 
+def _aabb_rotated_around_x(
+    aabb: tuple[float, float, float, float, float, float],
+    angle_deg: float,
+) -> tuple[float, float, float, float, float, float]:
+    """Axis-aligned bounds of *aabb* after rotating YZ around X by *angle_deg*."""
+    min_x, min_y, min_z, max_x, max_y, max_z = aabb
+    ys: list[float] = []
+    zs: list[float] = []
+    for y in (min_y, max_y):
+        for z in (min_z, max_z):
+            y2, z2 = rotate_yz(y, z, angle_deg)
+            ys.append(y2)
+            zs.append(z2)
+    return (min_x, min(ys), min(zs), max_x, max(ys), max(zs))
+
+
+def _rotate_yz_np(yy: np.ndarray, zz: np.ndarray, angle_deg: float) -> tuple[np.ndarray, np.ndarray]:
+    rad = np.deg2rad(float(angle_deg))
+    c = np.cos(rad)
+    s = np.sin(rad)
+    return yy * c - zz * s, yy * s + zz * c
+
+
 def carve_segment_into_grid(
     grid: ChunkedVoxelGrid,
     p0: tuple[float, float, float],
@@ -1546,6 +1601,8 @@ def carve_segment_into_grid(
     tool_unit_scale: float = 1.0,
     *,
     sparse_solid_frac: float = 0.5,
+    a0: float = 0.0,
+    a1: float = 0.0,
 ) -> set[tuple[int, int, int]]:
     """Carve one toolpath segment into ``grid``.
 
@@ -1555,7 +1612,37 @@ def carve_segment_into_grid(
     iff some tip pose on the segment contains it (Z-valid tip window + XY-closest
     tip, then profile radius). ``sparse_solid_frac`` selects the solid-only gather
     path (tests may force ``0.0`` / ``1.0``).
+
+    ``a0`` / ``a1`` are A-axis angles in degrees at the segment ends. Non-zero
+    A rotates the stock: voxels are tested in machine XYZ via ``Rx(-A)``.
     """
+    a0 = float(a0)
+    a1 = float(a1)
+    da = a1 - a0
+    if abs(da) > _MAX_DA_DEG:
+        n = max(1, int(math.ceil(abs(da) / _MAX_DA_DEG)))
+        dirty: set[tuple[int, int, int]] = set()
+        dxs = p1[0] - p0[0]
+        dys = p1[1] - p0[1]
+        dzs = p1[2] - p0[2]
+        for i in range(n):
+            t0 = i / n
+            t1 = (i + 1) / n
+            pi0 = (p0[0] + t0 * dxs, p0[1] + t0 * dys, p0[2] + t0 * dzs)
+            pi1 = (p0[0] + t1 * dxs, p0[1] + t1 * dys, p0[2] + t1 * dzs)
+            ai = a0 + 0.5 * (t0 + t1) * da
+            dirty |= carve_segment_into_grid(
+                grid,
+                pi0,
+                pi1,
+                tool_def,
+                tool_unit_scale,
+                sparse_solid_frac=sparse_solid_frac,
+                a0=ai,
+                a1=ai,
+            )
+        return dirty
+
     profile = _resolve_profile(tool_def, tool_unit_scale=tool_unit_scale)
     max_r = _max_profile_radius(profile)
     flute_z = profile[-1][0] if profile else 0.0
@@ -1577,6 +1664,10 @@ def carve_segment_into_grid(
         max(ys) + pad,
         max(zs) + flute_z + pad,
     )
+    angle = a0
+    rotate = abs(angle) > 1e-9
+    if rotate:
+        aabb = _aabb_rotated_around_x(aabb, angle)
 
     dirty: set[tuple[int, int, int]] = set()
     dx = p1[0] - p0[0]
@@ -1603,10 +1694,11 @@ def carve_segment_into_grid(
         cy1 = oy + cs * vs
         cz1 = oz + cs * vs
 
-        if cz1 < tip_z_lo or oz > tip_z_hi:
-            continue
-        if _segment_aabb_dist_xy(p0[0], p0[1], p1[0], p1[1], ox, oy, cx1, cy1) > xy_reject_r:
-            continue
+        if not rotate:
+            if cz1 < tip_z_lo or oz > tip_z_hi:
+                continue
+            if _segment_aabb_dist_xy(p0[0], p0[1], p1[0], p1[1], ox, oy, cx1, cy1) > xy_reject_r:
+                continue
 
         arr = grid.get_or_create_chunk(coord)
         if arr is None:
@@ -1627,12 +1719,16 @@ def carve_segment_into_grid(
         valid_y = (iy0 + np.arange(cs)) < grid.ny
         valid_z = (iz0 + np.arange(cs)) < grid.nz
         z_lo, z_hi = _local_z_slab(oz, vs, cs, tip_z_lo, tip_z_hi)
+        if rotate:
+            z_lo, z_hi = 0, cs
 
         if use_sparse:
             ixs, iys, izs = np.nonzero(arr)
             XX = ox + (ixs.astype(np.float64) + 0.5) * vs
             YY = oy + (iys.astype(np.float64) + 0.5) * vs
             ZZ = oz + (izs.astype(np.float64) + 0.5) * vs
+            if rotate:
+                YY, ZZ = _rotate_yz_np(YY, ZZ, -angle)
             inside = _voxels_inside_tool(
                 XX,
                 YY,
@@ -1669,6 +1765,8 @@ def carve_segment_into_grid(
             XX = lx[:, None, None]
             YY = ly[None, :, None]
             ZZ = lz[None, None, :]
+            if rotate:
+                YY, ZZ = _rotate_yz_np(YY, ZZ, -angle)
             inside = _voxels_inside_tool(
                 XX,
                 YY,
