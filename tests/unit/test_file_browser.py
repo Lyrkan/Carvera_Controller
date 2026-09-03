@@ -364,7 +364,8 @@ def test_action_state_device_folder_and_multi():
         multi_select_mode=False,
     )
     assert folder.show_preview is False
-    assert folder.show_upload is False
+    assert folder.show_upload is True
+    assert folder.show_upload_and_use is False
     assert folder.show_rename is True
     assert folder.show_delete is True
     assert folder.show_new_folder is True
@@ -382,10 +383,23 @@ def test_action_state_device_folder_and_multi():
     assert multi.show_delete is True
     assert multi.show_cancel_multi is True
     assert multi.show_preview is False
-    assert multi.show_upload is False
+    assert multi.show_upload is True
+    assert multi.show_upload_and_use is False
     assert multi.show_rename is False
     assert multi.show_new_folder is False
     assert multi.primary == "delete"
+    busy_multi = compute_action_state(
+        location=LOCATION_DEVICE,
+        firmware_mode=False,
+        ios=False,
+        machine_connected=True,
+        machine_idle=False,
+        selected_is_file=False,
+        selected_count=2,
+        multi_select_mode=True,
+    )
+    assert busy_multi.show_upload is False
+    assert busy_multi.show_delete is True
 
 
 def test_action_state_firmware_upload_only():
@@ -437,7 +451,7 @@ def test_action_state_machine_file_and_folder():
         multi_select_mode=False,
     )
     assert folder_state.show_use_as_job is False
-    assert folder_state.show_download is False
+    assert folder_state.show_download is True
     assert folder_state.show_rename is True
     assert folder_state.show_delete is True
     busy = compute_action_state(
@@ -481,7 +495,7 @@ def test_action_state_machine_disconnected_and_multi():
     assert multi.show_delete is True
     assert multi.show_cancel_multi is True
     assert multi.show_use_as_job is False
-    assert multi.show_download is False
+    assert multi.show_download is True
     assert multi.primary == "delete"
 
 
@@ -500,3 +514,148 @@ def test_action_state_ios_device_uses_browse():
     assert state.show_places is False
     assert state.show_multi_toggle is False
     assert state.show_rename is False
+
+
+def test_join_machine_path_and_basename():
+    from carveracontroller.ui.file_browser.transfer import join_machine_path, machine_basename
+
+    assert join_machine_path("/sd/gcodes", "tools", "a.nc") == "/sd/gcodes/tools/a.nc"
+    assert join_machine_path("\\sd\\gcodes", "inner") == "/sd/gcodes/inner"
+    assert machine_basename("/sd/gcodes/tools/") == "tools"
+    assert machine_basename("\\sd\\gcodes\\job.nc") == "job.nc"
+
+
+def test_plan_local_upload_nested_empty_and_hidden(tmp_path):
+    from carveracontroller.ui.file_browser.transfer import (
+        OP_MKDIR_REMOTE,
+        OP_UPLOAD,
+        plan_local_upload,
+    )
+
+    folder = tmp_path / "tools"
+    (folder / "inner").mkdir(parents=True)
+    (folder / "inner" / "a.nc").write_text("g")
+    (folder / ".secret").write_text("x")
+    (folder / "inner" / ".skip").write_text("y")
+    (folder / "empty").mkdir()
+    job = tmp_path / "job.nc"
+    job.write_text("h")
+
+    ops = plan_local_upload([str(folder), str(job)], "/sd/gcodes")
+    mkdir_dests = {op.dest for op in ops if op.kind == OP_MKDIR_REMOTE}
+    uploads = [(op.source, op.dest) for op in ops if op.kind == OP_UPLOAD]
+    assert "/sd/gcodes/tools" in mkdir_dests
+    assert "/sd/gcodes/tools/inner" in mkdir_dests
+    assert "/sd/gcodes/tools/empty" in mkdir_dests
+    assert (os.path.normpath(str(folder / "inner" / "a.nc")), "/sd/gcodes/tools/inner/a.nc") in uploads
+    assert (os.path.normpath(str(job)), "/sd/gcodes/job.nc") in uploads
+    assert all(".secret" not in dest and ".skip" not in dest for _src, dest in uploads)
+    assert all(op.kind in (OP_MKDIR_REMOTE, OP_UPLOAD) for op in ops)
+
+
+def test_top_level_upload_conflicts_and_skip_existing_mkdir():
+    from carveracontroller.ui.file_browser.transfer import (
+        OP_MKDIR_REMOTE,
+        OP_REMOVE_REMOTE,
+        OP_UPLOAD,
+        TransferOp,
+        add_remote_type_replacements,
+        require_nested_upload_type_checks,
+        skip_existing_remote_mkdirs,
+        top_level_upload_conflicts,
+    )
+
+    entries = [
+        {"name": "job.nc", "is_dir": False},
+        {"name": "tools", "is_dir": True},
+        {"name": "notes.txt", "is_dir": False},
+        {"name": "blocked.nc", "is_dir": True},
+    ]
+    ops = [
+        TransferOp(OP_UPLOAD, source="/tmp/job.nc", dest="/sd/gcodes/job.nc"),
+        TransferOp(OP_MKDIR_REMOTE, dest="/sd/gcodes/tools"),
+        TransferOp(OP_UPLOAD, source="/tmp/a.nc", dest="/sd/gcodes/tools/a.nc"),
+        TransferOp(OP_MKDIR_REMOTE, dest="/sd/gcodes/notes.txt"),
+        TransferOp(OP_UPLOAD, source="/tmp/blocked.nc", dest="/sd/gcodes/blocked.nc"),
+        TransferOp(OP_UPLOAD, source="/tmp/new.nc", dest="/sd/gcodes/new.nc"),
+    ]
+    conflicts = top_level_upload_conflicts(ops, "/sd/gcodes", entries)
+    assert conflicts == ["job.nc", "tools", "notes.txt", "blocked.nc"]
+    filtered = skip_existing_remote_mkdirs(ops, "/sd/gcodes", entries)
+    assert [op.dest for op in filtered if op.kind == OP_MKDIR_REMOTE] == ["/sd/gcodes/notes.txt"]
+    replacement_ops = add_remote_type_replacements(filtered, "/sd/gcodes", entries)
+    assert [(op.kind, op.dest) for op in replacement_ops] == [
+        (OP_UPLOAD, "/sd/gcodes/job.nc"),
+        (OP_UPLOAD, "/sd/gcodes/tools/a.nc"),
+        (OP_REMOVE_REMOTE, "/sd/gcodes/notes.txt"),
+        (OP_MKDIR_REMOTE, "/sd/gcodes/notes.txt"),
+        (OP_REMOVE_REMOTE, "/sd/gcodes/blocked.nc"),
+        (OP_UPLOAD, "/sd/gcodes/blocked.nc"),
+        (OP_UPLOAD, "/sd/gcodes/new.nc"),
+    ]
+    checked_ops = require_nested_upload_type_checks(replacement_ops, "/sd/gcodes")
+    assert [op.dest for op in checked_ops if op.check_remote_type] == ["/sd/gcodes/tools/a.nc"]
+
+
+def test_plan_download_and_local_conflicts(tmp_path):
+    from carveracontroller.ui.file_browser.transfer import (
+        OP_DOWNLOAD,
+        OP_MKDIR_LOCAL,
+        TransferOp,
+        local_download_conflicts,
+        local_destination_requires_replacement,
+        plan_download_dir_level,
+        plan_download_folder_root,
+        plan_machine_file_download,
+    )
+
+    dest = tmp_path / "inbox"
+    dest.mkdir()
+    existing = dest / "job.nc"
+    existing.write_text("old")
+    ops = plan_machine_file_download(
+        ["/sd/gcodes/job.nc", "/sd/gcodes/new.nc"],
+        str(dest),
+        [
+            {"path": "/sd/gcodes/job.nc", "is_dir": False, "size": 42},
+            {"path": "\\sd\\gcodes\\new.nc", "is_dir": False, "size": 17},
+        ],
+    )
+    assert [op.dest for op in ops] == [str(existing), str(dest / "new.nc")]
+    assert [op.size for op in ops] == [42, 17]
+    assert local_download_conflicts(ops) == [str(existing)]
+
+    first_duplicate = dest / "first" / "config.nc"
+    second_duplicate = dest / "second" / "config.nc"
+    first_duplicate.parent.mkdir()
+    second_duplicate.parent.mkdir()
+    first_duplicate.write_text("old")
+    second_duplicate.write_text("old")
+    duplicate_ops = [
+        TransferOp(OP_DOWNLOAD, dest=str(first_duplicate)),
+        TransferOp(OP_DOWNLOAD, dest=str(second_duplicate)),
+    ]
+    assert local_download_conflicts(duplicate_ops) == [
+        str(first_duplicate),
+        str(second_duplicate),
+    ]
+
+    blocked_folder = dest / "tools"
+    blocked_folder.write_text("not a directory")
+    local_root, mkdir_op = plan_download_folder_root("/sd/gcodes/tools", str(dest))
+    assert mkdir_op.kind == OP_MKDIR_LOCAL
+    assert local_root == str(dest / "tools")
+    assert local_destination_requires_replacement(mkdir_op) is True
+    assert local_download_conflicts([mkdir_op]) == [str(blocked_folder)]
+    level_ops, recurse = plan_download_dir_level(
+        [
+            {"name": "inner", "path": "/sd/gcodes/tools/inner", "is_dir": True, "size": 0},
+            {"name": "a.nc", "path": "/sd/gcodes/tools/a.nc", "is_dir": False, "size": 12},
+            {"name": ".hidden", "path": "/sd/gcodes/tools/.hidden", "is_dir": False, "size": 1},
+        ],
+        local_root,
+    )
+    assert any(op.kind == OP_MKDIR_LOCAL and op.dest == str(dest / "tools" / "inner") for op in level_ops)
+    assert any(op.kind == OP_DOWNLOAD and op.size == 12 for op in level_ops)
+    assert recurse == [("/sd/gcodes/tools/inner", str(dest / "tools" / "inner"))]
+    assert all(".hidden" not in op.dest for op in level_ops)

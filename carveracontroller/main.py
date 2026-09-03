@@ -174,6 +174,33 @@ from carveracontroller.ui.file_browser.sources import (
     remove_local_path,
     rename_local_path,
 )
+from carveracontroller.ui.file_browser.transfer import (
+    OP_DOWNLOAD,
+    OP_UPLOAD,
+    add_remote_type_replacements,
+    local_download_conflicts,
+    plan_local_upload,
+    plan_machine_file_download,
+    require_nested_upload_type_checks,
+    skip_existing_remote_mkdirs,
+    top_level_upload_conflicts,
+)
+from carveracontroller.ui.file_browser.transfer_coordinator import (
+    ERROR_DOWNLOAD,
+    ERROR_INTERNAL,
+    ERROR_LISTING,
+    ERROR_MKDIR_LOCAL,
+    ERROR_MKDIR_REMOTE,
+    ERROR_REMOVE_REMOTE,
+    ERROR_REPLACE_LOCAL,
+    ERROR_UPLOAD,
+    STAGE_DOWNLOAD,
+    STAGE_MKDIR_REMOTE,
+    STAGE_REMOVE_REMOTE,
+    STAGE_UPLOAD,
+    FileTransferCallbacks,
+    FileTransferCoordinator,
+)
 from carveracontroller.ui.file_browser.thumbnail import (
     is_gcode_path,
     machine_cache_key,
@@ -2788,6 +2815,7 @@ class Makera(RelativeLayout):
     uploading = False
     uploading_size = 0
     uploading_file = ""
+    _FILE_XFER_CMD_WAIT = 8
 
     downloading = False
     downloading_size = 0
@@ -3049,6 +3077,24 @@ class Makera(RelativeLayout):
         self.last_connection_method = Config.get("carvera", "last_connection_method", fallback="") or ""
 
         self.fill_remote_dir_callback = None
+        self.file_transfer = FileTransferCoordinator(
+            FileTransferCallbacks(
+                start_remote_listing=self._start_transfer_remote_listing,
+                start_remote_mkdir=self._start_transfer_remote_mkdir,
+                start_remote_remove=self._start_transfer_remote_remove,
+                upload=self._transfer_upload,
+                download=self._transfer_download,
+                cancel_io=self._cancel_active_transfer_io,
+                is_io_active=lambda: bool(self.uploading or self.downloading),
+                is_decompressing=lambda: self.decompstatus,
+                on_start=self._on_transfer_start,
+                on_progress=self._on_transfer_progress,
+                on_finish=self._on_transfer_finish,
+                on_failure=self._on_transfer_failure,
+                on_conflicts=self._on_transfer_conflicts,
+            ),
+            command_timeout=self._FILE_XFER_CMD_WAIT + 1,
+        )
 
         self.instantFSoverride = Config.get("carvera", "instantFSoverride") == "1"
 
@@ -4268,40 +4314,63 @@ class Makera(RelativeLayout):
                 self.controller.diagnoseUpdate = False
 
             if self.controller.loadNUM == LOAD_DIR:
-                if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                    if self.controller.loadERR:
-                        Clock.schedule_once(
-                            partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (self.loading_dir)), 0
-                        )
-                    elif t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                        Clock.schedule_once(
-                            partial(self.loadError, tr._("Timeout loading dir") + " '%s'!" % (self.loading_dir)), 0
-                        )
+                transfer_listing = self.file_transfer.listing_pending
+                load_timeout = (
+                    not self.controller.loadEOF
+                    and t - self.short_load_time
+                    > (self._FILE_XFER_CMD_WAIT if transfer_listing else SHORT_LOAD_TIMEOUT)
+                )
+                if self.controller.loadEOF or self.controller.loadERR or load_timeout:
+                    load_failed = self.controller.loadERR or load_timeout
+                    if transfer_listing and load_failed:
+                        while self.controller.load_buffer.qsize() > 0:
+                            self.controller.load_buffer.get_nowait()
+                        self.file_transfer.complete_listing(None, failed=True)
+                        self.controller.loadNUM = 0
+                        self.controller.loadEOF = False
+                        self.controller.loadERR = False
+                        continue
+                    if not transfer_listing:
+                        if self.controller.loadERR:
+                            Clock.schedule_once(
+                                partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (self.loading_dir)), 0
+                            )
+                        elif load_timeout:
+                            Clock.schedule_once(
+                                partial(self.loadError, tr._("Timeout loading dir") + " '%s'!" % (self.loading_dir)), 0
+                            )
                     self.controller.loadNUM = 0
                     self.controller.loadEOF = False
                     self.controller.loadERR = False
                     self.process_loaded_dir(self.fill_remote_dir)
             if self.controller.loadNUM == LOAD_RM:
-                if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
+                transfer_remove = self.file_transfer.remove_pending
+                remove_timeout = t - self.short_load_time > (
+                    self._FILE_XFER_CMD_WAIT if transfer_remove else SHORT_LOAD_TIMEOUT
+                )
+                if self.controller.loadEOF or self.controller.loadERR or remove_timeout:
                     deleting_file = getattr(self, "deleting_remote_file", self.file_popup.selected_machine_file)
-                    delete_failed = self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT
-                    if self.controller.loadERR:
-                        Clock.schedule_once(
-                            partial(self.loadError, tr._("Error deleting") + " '%s'!" % (deleting_file)), 0
-                        )
-                    elif t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                        Clock.schedule_once(
-                            partial(self.loadError, tr._("Timeout deleting") + "'%s'!" % (deleting_file)), 0
-                        )
+                    delete_error = self.controller.loadERR
+                    delete_timeout = (not delete_error) and remove_timeout
+                    delete_failed = delete_error or delete_timeout
                     self.controller.loadNUM = 0
                     self.controller.loadEOF = False
                     self.controller.loadERR = False
-                    if not delete_failed and getattr(self, "pending_remote_delete_files", []):
-                        Clock.schedule_once(self.removeNextRemoteFile, 0)
-                    else:
-                        self.pending_remote_delete_files = []
-                        self.deleting_remote_file = ""
-                        Clock.schedule_once(self.file_popup.refresh_machine, 0)
+                    if not self.file_transfer.complete_remove(delete_failed):
+                        if delete_error:
+                            Clock.schedule_once(
+                                partial(self.loadError, tr._("Error deleting") + " '%s'!" % (deleting_file)), 0
+                            )
+                        elif delete_timeout:
+                            Clock.schedule_once(
+                                partial(self.loadError, tr._("Timeout deleting") + "'%s'!" % (deleting_file)), 0
+                            )
+                        if not delete_failed and getattr(self, "pending_remote_delete_files", []):
+                            Clock.schedule_once(self.removeNextRemoteFile, 0)
+                        else:
+                            self.pending_remote_delete_files = []
+                            self.deleting_remote_file = ""
+                            Clock.schedule_once(self.file_popup.refresh_machine, 0)
             if self.controller.loadNUM == LOAD_MV:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
                     if self.controller.loadERR:
@@ -4325,27 +4394,34 @@ class Makera(RelativeLayout):
                     self.controller.loadERR = False
                     Clock.schedule_once(self.file_popup.refresh_machine, 0)
             if self.controller.loadNUM == LOAD_MKDIR:
-                if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                    if self.controller.loadERR:
-                        Clock.schedule_once(
-                            partial(
-                                self.loadError,
-                                tr._("Error making dir:") + " '%s'!" % (self.input_popup.txt_content.text.strip()),
-                            ),
-                            0,
-                        )
-                    elif t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                        Clock.schedule_once(
-                            partial(
-                                self.loadError,
-                                tr._("Timeout making dir:") + " '%s'!" % (self.input_popup.txt_content.text.strip()),
-                            ),
-                            0,
-                        )
+                transfer_mkdir = self.file_transfer.mkdir_pending
+                mkdir_timeout = t - self.short_load_time > (
+                    self._FILE_XFER_CMD_WAIT if transfer_mkdir else SHORT_LOAD_TIMEOUT
+                )
+                if self.controller.loadEOF or self.controller.loadERR or mkdir_timeout:
+                    load_err = self.controller.loadERR
+                    load_timeout = (not load_err) and mkdir_timeout
                     self.controller.loadNUM = 0
                     self.controller.loadEOF = False
                     self.controller.loadERR = False
-                    Clock.schedule_once(self.file_popup.refresh_machine, 0)
+                    if not self.file_transfer.complete_mkdir(load_err or load_timeout):
+                        if load_err:
+                            Clock.schedule_once(
+                                partial(
+                                    self.loadError,
+                                    tr._("Error making dir:") + " '%s'!" % (self.input_popup.txt_content.text.strip()),
+                                ),
+                                0,
+                            )
+                        elif load_timeout:
+                            Clock.schedule_once(
+                                partial(
+                                    self.loadError,
+                                    tr._("Timeout making dir:") + " '%s'!" % (self.input_popup.txt_content.text.strip()),
+                                ),
+                                0,
+                            )
+                        Clock.schedule_once(self.file_popup.refresh_machine, 0)
             if self.controller.loadNUM == LOAD_WIFI:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.wifi_load_time > WIFI_LOAD_TIMEOUT:
                     if self.controller.loadERR:
@@ -4678,29 +4754,40 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def check_and_upload(self):
-        filepath = self.file_popup.selected_device_file
-        if not filepath or os.path.isdir(filepath):
-            return
-        filename = os.path.basename(os.path.normpath(filepath))
-        if self.file_popup.machine_listing_has(filename):
-            # show message popup
-            self.confirm_popup.lb_title.text = tr._("File Already Exists")
-            self.confirm_popup.lb_content.text = tr._("Confirm to overwrite file:") + " \n '%s'?" % (filename)
-            self.confirm_popup.cancel = None
-            self.confirm_popup.confirm = partial(self.uploadLocalFile, filepath)
-            self.confirm_popup.open(self)
-        else:
-            if self.file_popup.firmware_mode:
-                # show message popup
-                self.confirm_popup.lb_title.text = tr._("Updating Firmware")
-                self.confirm_popup.lb_content.text = tr._(
-                    "Are you sure you want to update the firmware? A machine reset will be required to apply the new firmware."
-                )
+        if self.file_popup.firmware_mode:
+            filepath = self.file_popup.selected_device_file
+            if not filepath or os.path.isdir(filepath):
+                return
+            filename = os.path.basename(os.path.normpath(filepath))
+            if self.file_popup.machine_listing_has(filename):
+                self.confirm_popup.lb_title.text = tr._("File Already Exists")
+                self.confirm_popup.lb_content.text = tr._("Confirm to overwrite file:") + " \n '%s'?" % (filename)
                 self.confirm_popup.cancel = None
                 self.confirm_popup.confirm = partial(self.uploadLocalFile, filepath)
                 self.confirm_popup.open(self)
-            else:
-                self.uploadLocalFile(filepath)
+                return
+            self.confirm_popup.lb_title.text = tr._("Updating Firmware")
+            self.confirm_popup.lb_content.text = tr._(
+                "Are you sure you want to update the firmware? A machine reset will be required to apply the new firmware."
+            )
+            self.confirm_popup.cancel = None
+            self.confirm_popup.confirm = partial(self.uploadLocalFile, filepath)
+            self.confirm_popup.open(self)
+            return
+
+        paths = self._selected_browser_paths(device=True)
+        if not paths or self._file_xfer_busy():
+            return
+        dest_dir = self.file_popup.machine_dir
+        ops = plan_local_upload(paths, dest_dir)
+        conflicts = top_level_upload_conflicts(ops, dest_dir, self.file_popup._machine_entries)
+        ops = skip_existing_remote_mkdirs(ops, dest_dir, self.file_popup._machine_entries)
+        if not ops:
+            return
+        if conflicts:
+            self._confirm_transfer_overwrite(ops, conflicts, "upload")
+        else:
+            self._start_file_transfer_batch(ops, "upload")
 
     def select_file(self, remote_path, local_cached_file_path):
         """Select a file that is already present both locally and remotely"""
@@ -4784,22 +4871,27 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def check_and_save_to_device(self):
-        remote_path = self.file_popup.selected_machine_file
-        if not remote_path:
-            return
-        filename = os.path.basename(os.path.normpath(remote_path))
+        paths = self._selected_browser_paths(device=False)
         dest_dir = self.file_popup.device_dir
-        if not dest_dir:
+        if not paths or not dest_dir or self._file_xfer_busy():
             return
-        dest = os.path.join(dest_dir, filename)
-        if self.file_popup.device_has_file(filename):
-            self.confirm_popup.lb_title.text = tr._("File Already Exists")
-            self.confirm_popup.lb_content.text = tr._("Confirm to overwrite file:") + " \n '%s'?" % (filename)
-            self.confirm_popup.cancel = None
-            self.confirm_popup.confirm = partial(self.save_machine_file_to_device, remote_path, dest)
-            self.confirm_popup.open(self)
-        else:
-            self.save_machine_file_to_device(remote_path, dest)
+        has_folder = any(self.file_popup._path_is_dir(path) for path in paths)
+        if not has_folder:
+            ops = plan_machine_file_download(paths, dest_dir, self.file_popup._machine_entries)
+            if not ops:
+                return
+            conflicts = local_download_conflicts(ops)
+            if conflicts:
+                self._confirm_transfer_overwrite(ops, conflicts, "download")
+            else:
+                self._start_file_transfer_batch(ops, "download")
+            return
+        selections = [(path, self.file_popup._path_is_dir(path)) for path in paths]
+        self.file_transfer.prepare_download(
+            selections,
+            dest_dir,
+            list(self.file_popup._machine_entries),
+        )
 
     def save_machine_file_to_device(self, remote_path, dest):
         if not remote_path or not dest:
@@ -4808,6 +4900,201 @@ class Makera(RelativeLayout):
         self.downloading_size = self.file_popup.selected_machine_filesize
         self.downloading_config = False
         threading.Thread(target=self.doDownload, args=(remote_path, dest), kwargs={"open_after": False}).start()
+
+    def _file_xfer_busy(self) -> bool:
+        return bool(
+            self.uploading
+            or self.downloading
+            or self.decompstatus
+            or self.file_transfer.busy
+            or self.controller.loadNUM
+        )
+
+    def _cancel_active_transfer_io(self):
+        if self.uploading or self.downloading:
+            self.cancelProcessingFile()
+
+    def _selected_browser_paths(self, *, device: bool) -> list:
+        popup = self.file_popup
+        if device:
+            paths = [path for path in (popup.selected_device_paths or []) if path]
+            if not paths and popup.selected_device_file:
+                paths = [popup.selected_device_file]
+            return paths
+        paths = [path for path in (popup.selected_machine_paths or []) if path]
+        if not paths and popup.selected_machine_file:
+            paths = [popup.selected_machine_file]
+        return paths
+
+    def _confirm_transfer_overwrite(self, ops, conflicts, direction):
+        self.confirm_popup.lb_title.text = tr._("File Already Exists")
+        file_ops = [op for op in ops if op.kind in (OP_UPLOAD, OP_DOWNLOAD)]
+        if direction == "download":
+            conflict_labels = [
+                os.path.relpath(path, self.file_popup.device_dir)
+                for path in conflicts
+            ]
+            single_destination_matches = (
+                bool(file_ops)
+                and len(conflicts) == 1
+                and os.path.normcase(os.path.normpath(file_ops[0].dest))
+                == os.path.normcase(os.path.normpath(conflicts[0]))
+            )
+        else:
+            conflict_labels = conflicts
+            single_destination_matches = (
+                bool(file_ops)
+                and len(conflicts) == 1
+                and os.path.basename(os.path.normpath(file_ops[0].dest)) == conflicts[0]
+            )
+        single_file_conflict = (
+            len(file_ops) == 1
+            and single_destination_matches
+        )
+        if single_file_conflict:
+            self.confirm_popup.lb_content.text = (
+                tr._("Confirm to overwrite file:") + " \n '%s'?" % conflict_labels[0]
+            )
+        else:
+            preview = "\n".join(conflict_labels[:5])
+            if len(conflict_labels) > 5:
+                preview += "\n..."
+            self.confirm_popup.lb_content.text = (
+                tr._("Confirm to merge or overwrite %d existing items?") % len(conflicts) + "\n\n%s" % preview
+            )
+        self.confirm_popup.cancel = None
+        self.confirm_popup.confirm = partial(self._start_file_transfer_batch, ops, direction, True)
+        self.confirm_popup.open(self)
+
+    def _start_file_transfer_batch(self, ops, direction, overwrite=False):
+        if self._file_xfer_busy():
+            return False
+        if overwrite and direction == "upload":
+            ops = add_remote_type_replacements(
+                ops,
+                self.file_popup.machine_dir,
+                self.file_popup._machine_entries,
+            )
+            if "lz" in self.filetype:
+                ops = require_nested_upload_type_checks(ops, self.file_popup.machine_dir)
+        return self.file_transfer.start_batch(ops, direction, overwrite)
+
+    def _start_transfer_remote_listing(self, path):
+        if not self.loadRemoteDir(path, transfer=True):
+            raise RuntimeError("Controller load command already in progress")
+
+    def _start_transfer_remote_mkdir(self, path):
+        if self.controller.loadNUM:
+            raise RuntimeError("Controller load command already in progress")
+        self.controller.sendNUM = 0
+        self.controller.loadNUM = LOAD_MKDIR
+        self.controller.loadEOF = False
+        self.controller.loadERR = False
+        self.short_load_time = time.time()
+        self.controller.mkdirCommand(os.path.normpath(path))
+
+    def _start_transfer_remote_remove(self, path):
+        if self.controller.loadNUM:
+            raise RuntimeError("Controller load command already in progress")
+        self.deleting_remote_file = path
+        self.controller.sendNUM = 0
+        self.controller.loadNUM = LOAD_RM
+        self.controller.loadEOF = False
+        self.controller.loadERR = False
+        self.short_load_time = time.time()
+        self.controller.rmCommand(os.path.normpath(path))
+
+    def _transfer_upload(self, op):
+        filepath = op.source
+        self.controller.sendNUM = SEND_FILE
+        self.uploading_file = filepath
+        self.original_upload_filepath = filepath
+        if "lz" in self.filetype:
+            qlzfilename = self.compress_file(filepath)
+            if qlzfilename:
+                self.uploading_file = qlzfilename
+        if self.file_transfer.canceled:
+            if self.uploading_file != filepath and os.path.exists(self.uploading_file):
+                os.remove(self.uploading_file)
+            return None
+        return self.doUpload(None, remote_path=op.dest, show_progress=False)
+
+    def _transfer_download(self, op):
+        self.downloading_file = op.source
+        self.downloading_size = op.size
+        self.downloading_config = False
+        return self.doDownload(op.source, op.dest, show_progress=False, open_after=False)
+
+    def _on_transfer_start(self, direction, preparing):
+        if preparing:
+            text = tr._("Preparing download...")
+        else:
+            text = tr._("Uploading") if direction == "upload" else tr._("Downloading")
+        Clock.schedule_once(partial(self.progressStart, text, self.file_transfer.cancel), 0)
+
+    def _on_transfer_progress(self, stage, op, file_index, total_files):
+        if stage == STAGE_REMOVE_REMOTE:
+            label = tr._("Deleting") + "\n%s" % op.dest
+        elif stage == STAGE_MKDIR_REMOTE:
+            label = tr._("Creating folder") + "\n%s" % op.dest
+        elif stage == STAGE_UPLOAD:
+            label = tr._("Uploading") + " (%d/%d)\n%s" % (
+                file_index,
+                total_files,
+                os.path.basename(op.source),
+            )
+        elif stage == STAGE_DOWNLOAD:
+            label = tr._("Downloading") + " (%d/%d)\n%s" % (
+                file_index,
+                total_files,
+                os.path.basename(op.dest),
+            )
+        else:
+            return
+        Clock.schedule_once(partial(self.progressUpdate, 0, label, False), 0)
+
+    def _on_transfer_finish(self, direction, refresh):
+        Clock.schedule_once(self.progressFinish, 0.1)
+        if not refresh:
+            return
+        if direction == "upload":
+            Clock.schedule_once(self.file_popup.refresh_machine, 0.15)
+        else:
+            Clock.schedule_once(lambda *_: self.file_popup.list_device_dir(self.file_popup.device_dir), 0.15)
+
+    def _on_transfer_failure(self, failure):
+        if failure.kind == ERROR_LISTING:
+            message = tr._("Error loading dir") + " '%s'!" % failure.path
+        elif failure.kind == ERROR_REPLACE_LOCAL:
+            message = tr._("Error replacing") + " '%s'!" % failure.path
+        elif failure.kind == ERROR_REMOVE_REMOTE:
+            message = tr._("Error deleting") + " '%s'!" % failure.path
+        elif failure.kind in (ERROR_MKDIR_REMOTE, ERROR_MKDIR_LOCAL):
+            message = tr._("Error making dir:") + " '%s'!" % failure.path
+        elif failure.kind == ERROR_UPLOAD:
+            message = tr._("Upload file error!")
+        elif failure.kind == ERROR_DOWNLOAD:
+            md5_failed = bool(
+                getattr(getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False)
+            )
+            message = (
+                tr._(
+                    "Download file error! MD5 hash doesn't match what is expected. "
+                    "Possible corruption during transfer or on SD card."
+                )
+                if md5_failed
+                else tr._("Download file error!")
+            )
+        elif failure.kind == ERROR_INTERNAL:
+            message = tr._("File transfer error!")
+        else:
+            return
+        if failure.detail:
+            message += "\n" + failure.detail
+        Clock.schedule_once(partial(self.show_message_popup, message, False), 0.2)
+
+    def _on_transfer_conflicts(self, ops, conflicts, direction):
+        Clock.schedule_once(partial(self._confirm_transfer_overwrite, ops, conflicts, direction), 0.15)
 
     # -----------------------------------------------------------------------
     def start_back_up_config(self):
@@ -5115,11 +5402,15 @@ class Makera(RelativeLayout):
             if self.controller.comms.uses_framed_transfer:
                 self.controller.pauseStream(0.0)
                 self.controller.downloadCommand(remote_path)
-                progress_cb = self.downloadCallback_framed if show_progress else None
+                progress_cb = self.downloadCallback_framed if show_progress or self.file_transfer.active else None
             else:
                 self.controller.downloadCommand(remote_path)
                 self.controller.pauseStream(0.2)
-                progress_cb = partial(self.downloadCallback, remote_path) if show_progress else None
+                progress_cb = (
+                    partial(self.downloadCallback, remote_path)
+                    if show_progress or self.file_transfer.active
+                    else None
+                )
             download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
         except Exception:
             logger.error(sys.exc_info()[1])
@@ -5150,7 +5441,7 @@ class Makera(RelativeLayout):
                     else tr._("Download config file error!")
                 )
                 Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0.2)
-            else:
+            elif not self.file_transfer.active:
                 error_msg = (
                     tr._(
                         "Download file error! MD5 hash doesn't match what is expected. "
@@ -5209,8 +5500,14 @@ class Makera(RelativeLayout):
                     self.load_gcode_file(local_path)
                     self._ingest_machine_gcode_thumbnail(remote_path, local_path)
                 else:
-                    if self._decompress_downloaded_file_in_place(local_path):
+                    decompressed = self._decompress_downloaded_file_in_place(
+                        local_path,
+                        show_error=not self.file_transfer.active,
+                    )
+                    if decompressed:
                         self._ingest_machine_gcode_thumbnail(remote_path, local_path)
+                    else:
+                        download_result = None
 
             if not was_config_download:
                 self.update_recent_remote_dir_list(os.path.dirname(remote_path))
@@ -5224,6 +5521,7 @@ class Makera(RelativeLayout):
 
         if show_progress:
             Clock.schedule_once(self.progressFinish, 0.1)
+        return download_result
 
     def onFirmwareDetected(self, version, *args):
         app = App.get_running_app()
@@ -5385,7 +5683,10 @@ class Makera(RelativeLayout):
     # -----------------------------------------------------------------------
     def downloadCallback(self, remote_path, packet_size, success_count, error_count):
         """Progress callback for legacy XMODEM downloads."""
-        packets = self.downloading_size / packet_size + (1 if self.downloading_size % packet_size > 0 else 0)
+        packets = max(
+            1,
+            self.downloading_size / packet_size + (1 if self.downloading_size % packet_size > 0 else 0),
+        )
         Clock.schedule_once(
             partial(
                 self.progressUpdate, success_count * 100.0 / packets, tr._("Downloading") + " \n%s" % remote_path, False
@@ -5554,7 +5855,12 @@ class Makera(RelativeLayout):
                 )
 
     # -----------------------------------------------------------------------
-    def loadRemoteDir(self, ls_dir):
+    def loadRemoteDir(self, ls_dir, *, transfer=False):
+        coordinator = getattr(self, "file_transfer", None)
+        if not transfer and coordinator is not None and coordinator.busy:
+            return False
+        if transfer and self.controller.loadNUM:
+            return False
         self.loading_dir = ls_dir
         self.controller.sendNUM = 0
         self.controller.loadNUM = LOAD_DIR
@@ -5562,6 +5868,7 @@ class Makera(RelativeLayout):
         self.controller.loadERR = False
         self.short_load_time = time.time()
         self.controller.lsCommand(os.path.normpath(ls_dir))
+        return True
 
     # -----------------------------------------------------------------------
     def removeRemoteFile(self, filename):
@@ -5816,7 +6123,7 @@ class Makera(RelativeLayout):
             return None
 
     # -----------------------------------------------------------------------
-    def _decompress_downloaded_file_in_place(self, filepath):
+    def _decompress_downloaded_file_in_place(self, filepath, show_error=True):
         """Decompress a QuickLZ download in place without a `.lz/` sidecar folder."""
         try:
             with open(filepath, "rb") as f:
@@ -5842,17 +6149,18 @@ class Makera(RelativeLayout):
                 os.rename(lz_tmp, filepath)
             except OSError:
                 pass
-            Clock.schedule_once(partial(self.show_message_popup, tr._("Download file error!"), False), 0)
+            if show_error:
+                Clock.schedule_once(partial(self.show_message_popup, tr._("Download file error!"), False), 0)
             return False
 
         try:
             os.remove(lz_tmp)
         except OSError:
             pass
-        return self._verify_deferred_download_md5(filepath)
+        return self._verify_deferred_download_md5(filepath, show_error=show_error)
 
     # -----------------------------------------------------------------------
-    def _verify_deferred_download_md5(self, filepath):
+    def _verify_deferred_download_md5(self, filepath, show_error=True):
         """Verify a machine-advertised MD5 after .lz decompress. Returns False on mismatch."""
         modem = getattr(getattr(self.controller, "stream", None), "modem", None)
         expected = getattr(modem, "deferred_download_md5", None) if modem is not None else None
@@ -5876,17 +6184,20 @@ class Makera(RelativeLayout):
                 os.remove(filepath)
         except OSError:
             pass
-        Clock.schedule_once(
-            partial(
-                self.show_message_popup,
-                tr._(
-                    "Download file error! MD5 hash doesn't match what is expected. "
-                    "Possible corruption during transfer or on SD card."
+        if modem is not None:
+            modem.download_md5_failed = True
+        if show_error:
+            Clock.schedule_once(
+                partial(
+                    self.show_message_popup,
+                    tr._(
+                        "Download file error! MD5 hash doesn't match what is expected. "
+                        "Possible corruption during transfer or on SD card."
+                    ),
+                    False,
                 ),
-                False,
-            ),
-            0,
-        )
+                0,
+            )
         return False
 
     # -----------------------------------------------------------------------
@@ -5937,7 +6248,7 @@ class Makera(RelativeLayout):
             return False
 
     # -----------------------------------------------------------------------
-    def uploadLocalFile(self, filepath, callback=None):
+    def uploadLocalFile(self, filepath, callback=None, remote_path=None, show_progress=True):
         self.controller.sendNUM = SEND_FILE
         self.uploading_file = filepath
         self.original_upload_filepath = filepath  # Store original path for recent directory tracking
@@ -5945,21 +6256,29 @@ class Makera(RelativeLayout):
             qlzfilename = self.compress_file(filepath)
             if qlzfilename:
                 self.uploading_file = qlzfilename
-        threading.Thread(target=self.doUpload, args=(callback,)).start()
+        threading.Thread(target=self.doUpload, args=(callback, remote_path, show_progress)).start()
 
     # -----------------------------------------------------------------------
-    def doUpload(self, callback):
+    def doUpload(self, callback, remote_path=None, show_progress=True):
         self.uploading_size = os.path.getsize(self.uploading_file)
-        remotename = os.path.join(self.file_popup.machine_dir, os.path.basename(os.path.normpath(self.uploading_file)))
+        if remote_path:
+            remotename = remote_path
+            if self.uploading_file.endswith(".lz") and not str(remotename).endswith(".lz"):
+                remotename = str(remotename) + ".lz"
+        else:
+            remotename = os.path.join(
+                self.file_popup.machine_dir, os.path.basename(os.path.normpath(self.uploading_file))
+            )
         if self.file_popup.firmware_mode:
             remotename = "/sd/firmware.bin"
         displayname = self.uploading_file
         if displayname.endswith(".lz"):
             # 删除 ".lz" 后缀
             displayname = displayname[:-3]
-        Clock.schedule_once(
-            partial(self.progressStart, tr._("Uploading") + "\n%s" % displayname, self.cancelProcessingFile), 0
-        )
+        if show_progress:
+            Clock.schedule_once(
+                partial(self.progressStart, tr._("Uploading") + "\n%s" % displayname, self.cancelProcessingFile), 0
+            )
         self.uploading = True
         self.controller.pauseStream(1)
         upload_result = None
@@ -5976,7 +6295,8 @@ class Makera(RelativeLayout):
         self.controller.resumeStream()
         self.uploading = False
 
-        Clock.schedule_once(self.progressFinish, 0)
+        if show_progress:
+            Clock.schedule_once(self.progressFinish, 0)
 
         self.heartbeat_time = time.time()
 
@@ -5990,13 +6310,12 @@ class Makera(RelativeLayout):
             if self.uploading_file.endswith(".lz"):
                 os.remove(self.uploading_file)
             # show message popup
-            Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
+            if show_progress:
+                Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
         else:
             # copy file to application directory if needed
-            remote_path = os.path.join(
-                self.file_popup.machine_dir, os.path.basename(os.path.normpath(self.uploading_file))
-            )
-            remote_post_path = remote_path.replace("/sd/", "").replace("\\sd\\", "")
+            cache_remote = remotename
+            remote_post_path = cache_remote.replace("/sd/", "").replace("\\sd\\", "")
             local_path = os.path.join(self.temp_dir, remote_post_path)
             if self.uploading_file != local_path and not self.file_popup.firmware_mode:
                 if self.uploading_file.endswith(".lz"):
@@ -6035,9 +6354,10 @@ class Makera(RelativeLayout):
                 self.decompstatus = True
                 os.remove(self.uploading_file)
                 self.decomptime = time.time()
-                Clock.schedule_once(
-                    partial(self.progressStart, tr._("Decompressing") + "\n%s" % displayname, False), 0.2
-                )
+                if show_progress:
+                    Clock.schedule_once(
+                        partial(self.progressStart, tr._("Decompressing") + "\n%s" % displayname, False), 0.2
+                    )
 
         self.controller.sendNUM = 0
         if upload_result and callback:  # Only run callback if upload succeeded
@@ -6048,8 +6368,14 @@ class Makera(RelativeLayout):
             else:
                 callback(remotename, local_path)
         # For iOS we display the file list remotely only so we need to refresh it but on main thread
-        if upload_result and not self.file_popup.firmware_mode and not self.uploading_file.endswith(".lz"):
+        if (
+            upload_result
+            and show_progress
+            and not self.file_popup.firmware_mode
+            and not self.uploading_file.endswith(".lz")
+        ):
             Clock.schedule_once(self.file_popup.refresh_machine, 0)
+        return upload_result
 
     # -----------------------------------------------------------------------
     def confirm_reset(self, *args):
@@ -6071,6 +6397,7 @@ class Makera(RelativeLayout):
     def process_loaded_dir(self, *args):
         is_dir = False
         file_list = []
+        listing_dir = (self.loading_dir or "").replace("\\", "/").rstrip("/")
         while self.controller.load_buffer.qsize() > 0:
             line = self.controller.load_buffer.get_nowait().strip("\r").strip("\n")
             if len(line) > 0 and line[0] != "<":
@@ -6094,7 +6421,7 @@ class Makera(RelativeLayout):
                     file_list.append(
                         {
                             "name": file_infos[0],
-                            "path": f"{self.file_popup.machine_dir}/{file_infos[0]}",
+                            "path": f"{listing_dir}/{file_infos[0]}" if listing_dir else file_infos[0],
                             "is_dir": is_dir,
                             "size": int(file_infos[1]),
                             "date": timestamp,
@@ -6106,6 +6433,12 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def fill_remote_dir(self, file_list, *args):
+        if self.file_transfer.complete_listing(file_list):
+            return
+        listing_dir = (self.loading_dir or "").replace("\\", "/").rstrip("/")
+        visible = (self.file_popup.machine_dir or "").replace("\\", "/").rstrip("/")
+        if listing_dir and visible and listing_dir != visible:
+            return
         self.file_popup.apply_machine_listing(file_list)
         if self.fill_remote_dir_callback:
             callback = self.fill_remote_dir_callback
@@ -6267,9 +6600,11 @@ class Makera(RelativeLayout):
     def updateCompressProgress(self, value):
         Clock.schedule_once(partial(self.progressUpdate, value * 100.0 / self.fileCompressionBlocks, "", True), 0)
         if value == self.fileCompressionBlocks:
-            Clock.schedule_once(self.progressFinish, 0)
-            # Refresh the remote dir since upload finished
-            Clock.schedule_once(self.file_popup.refresh_machine, 0)
+            batch = self.file_transfer.active
+            if not batch:
+                Clock.schedule_once(self.progressFinish, 0)
+                # Refresh the remote dir since upload finished
+                Clock.schedule_once(self.file_popup.refresh_machine, 0)
             self.decompstatus = False
             # Call pending callback after decompression completes (for .lz files)
             if hasattr(self, "pending_decompress_callback") and self.pending_decompress_callback:

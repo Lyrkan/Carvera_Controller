@@ -469,8 +469,10 @@ def compute_action_state(
                 show_places=False,
                 search_enabled=False,
             )
+        can_upload = selected_count > 0 and machine_idle
         if multi_select_mode:
             return ActionState(
+                show_upload=can_upload,
                 show_delete=selected_count > 0,
                 show_cancel_multi=True,
                 show_places=True,
@@ -481,7 +483,7 @@ def compute_action_state(
         single_item = selected_count == 1
         return ActionState(
             show_preview=single_file,
-            show_upload=single_file and machine_idle,
+            show_upload=can_upload,
             show_upload_and_use=single_file and machine_idle,
             show_rename=single_item,
             show_delete=selected_count > 0,
@@ -495,8 +497,10 @@ def compute_action_state(
     if not machine_connected:
         return ActionState(show_places=False, search_enabled=False)
 
+    can_download = selected_count > 0 and machine_idle
     if multi_select_mode:
         return ActionState(
+            show_download=can_download,
             show_delete=selected_count > 0,
             show_cancel_multi=True,
             show_places=True,
@@ -508,7 +512,7 @@ def compute_action_state(
     single_item = selected_count == 1
     return ActionState(
         show_use_as_job=single_file,
-        show_download=single_file and machine_idle,
+        show_download=can_download,
         show_rename=single_item,
         show_delete=selected_count > 0,
         show_new_folder=machine_idle,
