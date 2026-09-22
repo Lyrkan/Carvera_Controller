@@ -1003,7 +1003,7 @@ def test_try_mesh_and_emit_aborts_after_generation_bump():
     sim = StockSimulator(on_meshes_ready=lambda meshes: received.append(meshes), mesh_throttle_s=0.05)
     try:
         sim.reset(bounds, cell_size_mm=1.0, enable=True, carver_mode="voxel")
-        # Stop the worker so only our direct helper calls populate ``received``.
+        # Stop the worker so only these direct publish calls populate ``received``.
         sim.stop()
         backend = sim.backend
         assert backend is not None
@@ -1012,7 +1012,7 @@ def test_try_mesh_and_emit_aborts_after_generation_bump():
 
         # Happy path: matching generation emits a replace of the stock shell.
         dirty = sim._initial_surface_dirty_keys(backend)
-        assert sim._try_mesh_and_emit(backend, dirty, gen, replace=True) is True
+        assert sim._display.publish(sim, backend, dirty, gen, replace=True) is True
         assert received and "__replace__" in received[-1]
 
         # Bump generation as reset/disable/recarve would.
@@ -1020,7 +1020,7 @@ def test_try_mesh_and_emit_aborts_after_generation_bump():
             sim._generation += 1
 
         received.clear()
-        assert sim._try_mesh_and_emit(backend, set(), gen, replace=True) is False
+        assert sim._display.publish(sim, backend, set(), gen, replace=True) is False
         assert received == []
     finally:
         sim.stop()
@@ -1047,7 +1047,7 @@ def test_try_mesh_and_emit_aborts_when_grid_replaced():
             sim._generation += 1
             sim._backend = type(stale)(bounds, 1.0)
 
-        assert sim._try_mesh_and_emit(stale, {(0, 0, 0)}, gen, replace=False) is False
+        assert sim._display.publish(sim, stale, {(0, 0, 0)}, gen, replace=False) is False
         assert received == []
     finally:
         sim.stop()
@@ -1171,7 +1171,7 @@ def test_try_mesh_and_emit_uses_partial_copy_result():
         expected = mesh_dirty_chunks(grid, mesh_keys)
 
         received.clear()
-        assert sim._try_mesh_and_emit(backend, dirty, sim.generation, replace=False) is True
+        assert sim._display.publish(sim, backend, dirty, sim.generation, replace=False) is True
         assert len(received) == 1
         assert received[0] == expected
     finally:
@@ -2394,17 +2394,17 @@ def test_mesh_flush_emits_all_dirty_tiles(monkeypatch):
     flush_dirty: list[int] = []
 
     sim = StockSimulator(on_meshes_ready=lambda _m: None, mesh_throttle_s=0.02)
-    orig = sim._try_mesh_and_emit
+    orig = sim._display.publish
 
-    def _count(backend, dirty, gen, *, replace, force_emit=False):
+    def _count(sim_arg, backend, dirty, gen, *, replace, force_emit=False):
         if force_emit:
             flush_dirty.append(len(dirty))
-        return orig(backend, dirty, gen, replace=replace, force_emit=force_emit)
+        return orig(sim_arg, backend, dirty, gen, replace=replace, force_emit=force_emit)
 
     try:
         sim.reset(bounds, cell_size_mm=1.0, enable=True, carver_mode="voxel")
         assert _wait_until(lambda: not sim.resimulating, timeout=2.0)
-        sim._try_mesh_and_emit = _count  # type: ignore[method-assign]
+        sim._display.publish = _count  # type: ignore[method-assign]
         sim.set_mesh_updates_enabled(False)
         sim.set_toolpath(positions, vertex_types, tools, {1: tool})
         sim.set_display_vertex(n_steps)

@@ -21,6 +21,7 @@ from carveracontroller.addons.stock.simulator.carver_select import (
     recommend_carver,
 )
 from carveracontroller.addons.stock.simulator.carvers.laser_map import pick_laser_cell_size_mm
+from carveracontroller.addons.stock.simulator.display import RemeshDisplay
 from carveracontroller.addons.stock.simulator.simulation_quality import (
     CHECKPOINT_SLOTS_BY_LEVEL,
     DEFAULT_CHECKPOINT_LEVEL,
@@ -411,8 +412,10 @@ class StockSimulator:
         on_progress: ProgressCallback | None = None,
         on_checkpoints: CheckpointsCallback | None = None,
         mesh_throttle_s: float = DEFAULT_MESH_THROTTLE_S,
+        display=None,
     ):
         self._on_meshes_ready = on_meshes_ready
+        self._display = display if display is not None else RemeshDisplay()
         self._on_progress = on_progress
         self._on_checkpoints = on_checkpoints
         self._mesh_throttle_s = mesh_throttle_s
@@ -1477,7 +1480,7 @@ class StockSimulator:
                 # leftover display-dirty tiles first or paused scrub stays stale.
                 if mesh_updates and (pending_dirty or bool(getattr(live, "_laser_dirty", False))):
                     batch = _take_pending_mesh_keys(pending_dirty, unlimited=True)
-                    if self._try_mesh_and_emit(live, batch, gen, replace=False):
+                    if self._display.publish(self, live, batch, gen, replace=False):
                         last_emit = time.monotonic()
                     else:
                         pending_dirty.update(batch)
@@ -1587,7 +1590,7 @@ class StockSimulator:
                             # this emit did not cover.
                             halo = set(live.expand_dirty(batch))
                             pending_dirty.difference_update(halo)
-                        if self._try_mesh_and_emit(live, batch, gen, replace=replace, force_emit=do_flush):
+                        if self._display.publish(self, live, batch, gen, replace=replace, force_emit=do_flush):
                             last_emit = time.monotonic()
                             with self._lock:
                                 if replace:
@@ -1635,92 +1638,8 @@ class StockSimulator:
                 enabled = self._enabled
                 mesh_updates = self._mesh_updates_enabled
             if enabled and live is not None and mesh_updates:
-                self._try_mesh_and_emit(live, pending_dirty, gen, replace=False)
+                self._display.publish(self, live, pending_dirty, gen, replace=False)
             pending_dirty.clear()
-
-    def _try_mesh_and_emit(
-        self,
-        backend,
-        dirty: set[tuple[int, int, int]],
-        gen: int,
-        *,
-        replace: bool,
-        force_emit: bool = False,
-    ) -> bool:
-        """Copy mesh-relevant tiles under lock, mesh unlocked, emit if still current.
-
-        Generation is stamped under lock to match the emitted meshes.
-        ``force_emit`` (pause flush) notifies even when nothing is dirty so the
-        viewer can swap AABB fill for carved stock.
-        """
-        if not self._on_meshes_ready:
-            return True
-
-        with self._lock:
-            if self._generation != gen or not self._enabled or self._backend is None:
-                return False
-            if backend is not self._backend:
-                return False
-            dirty_keys = set(dirty)
-            # Cylindrical wraps in θ and is drawn as one field. Playback patches
-            # that field in place (no __replace__) so the viewer does not
-            # destroy GPU meshes every throttle window. Heightmap/voxel tiles
-            # patch incrementally.
-            coalesce = str(getattr(backend, "kind", "")) == BACKEND_CYLINDRICAL
-            if dirty_keys:
-                if coalesce:
-                    mesh_keys = backend.initial_surface_keys()
-                    tmp = backend.copy_tiles(mesh_keys)
-                else:
-                    mesh_keys = backend.expand_dirty(dirty_keys)
-                    copy_keys = backend.expand_dirty(mesh_keys)
-                    tmp = backend.copy_tiles(copy_keys)
-            else:
-                mesh_keys = set()
-                tmp = None
-
-        if dirty_keys and tmp is not None:
-            meshes = tmp.mesh_tiles(mesh_keys)
-        else:
-            meshes = {}
-
-        with self._lock:
-            if self._generation != gen or self._backend is None:
-                return False
-            include_laser = False
-            laser_payload = None
-            take = getattr(backend, "take_laser_dirty", None)
-            get = getattr(backend, "laser_gpu_payload", None)
-            if take is not None and take():
-                include_laser = True
-                laser_payload = get() if get is not None else None
-            elif replace and get is not None:
-                include_laser = True
-                laser_payload = get()
-            try:
-                if coalesce and meshes:
-                    current = {k for k, packed in meshes.items() if packed is not None}
-                    if not replace:
-                        for old in self._coalesce_gpu_keys - current:
-                            meshes[old] = None
-                    self._coalesce_gpu_keys = current
-                out: dict = {}
-                if replace:
-                    if dirty_keys or meshes:
-                        out["__replace__"] = meshes
-                    if include_laser:
-                        out["__laser__"] = laser_payload
-                    if out or force_emit:
-                        self._on_meshes_ready(out)
-                    return True
-                out = dict(meshes)
-                if include_laser:
-                    out["__laser__"] = laser_payload
-                if out or force_emit:
-                    self._on_meshes_ready(out)
-            except Exception:
-                logger.exception("stock mesh callback failed")
-            return True
 
     def _carve_one(
         self,

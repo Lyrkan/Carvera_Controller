@@ -1,0 +1,25 @@
+diff -ur kivy-2.3.1/kivy/core/window/_window_sdl2.pyx kivy-2.3.1/kivy/core/window/_window_sdl2.pyx
+--- kivy-2.3.1/kivy/core/window/_window_sdl2.pyx	2026-09-21 22:20:22.075393982 +0200
++++ kivy-2.3.1/kivy/core/window/_window_sdl2.pyx	2026-09-21 22:20:22.078168850 +0200
+@@ -234,12 +234,20 @@
+         if not self.win:
+             self.die()
+ 
+-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2)
++        # This recipe is Android-only. GLES 3 guarantees vertex texture fetch,
++        # which the heightmap/rotary field shader needs. GLES 2 devices retry
++        # below; the manifest must not require GLES 3 or they could not install.
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 4)
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3)
+         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0)
+ 
+         if gl_backend != "mock":
+             self.ctx = SDL_GL_CreateContext(self.win)
+             if not self.ctx:
++                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2)
++                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0)
++                self.ctx = SDL_GL_CreateContext(self.win)
++            if not self.ctx:
+                 self.die()
+ 
+         # vsync

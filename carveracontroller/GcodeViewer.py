@@ -61,6 +61,7 @@ from .addons.stock.simulator import (
     StockSimulator,
 )
 from .addons.stock.simulator.carver_select import DEFAULT_CARVER_MODE, normalize_carver_mode
+from .addons.stock.simulator.display import RemeshDisplay, select_stock_display, vertex_texture_image_units
 from .addons.stock.simulator.mesh_format import VERTEX_FORMAT as CARVED_VERTEX_FORMAT
 from .addons.stock.simulator.simulation_quality import (
     CHECKPOINT_SLOTS_BY_LEVEL,
@@ -393,6 +394,7 @@ VIEW_CUBE_TOOLBAR_INSET = dp(48)
 VIEW_CUBE_TEXTURE_UNIT = 1
 VIEW_CUBE_WORLD_SCALE = 0.5
 LASER_DECAL_TEXTURE_UNIT = 1
+FIELD_TEXTURE_UNIT = 2
 
 
 # Assets (3D models / textures)
@@ -765,7 +767,11 @@ class GCodeViewer(Widget):
         self._bed_wcs_applied: tuple[float, float, float, float] | None = None
 
         self.carvedmesh = RenderContext()
-        self.carvedmesh.shader.source = os.path.join(shader_dir, "carved_stock.glsl")
+        self._carved_stock_shader = os.path.join(shader_dir, "carved_stock.glsl")
+        self._carved_field_shader = os.path.join(shader_dir, "carved_field.glsl")
+        self._carved_shader_kind = "stock"
+        self._field_texture = None
+        self.carvedmesh.shader.source = self._carved_stock_shader
         self.carvedmesh["vertex_scale"] = 1.0
         self.carvedmesh["laser_enabled"] = 0.0
         self.carvedmesh["laser_mode"] = 0.0
@@ -865,10 +871,18 @@ class GCodeViewer(Widget):
         self._sim_progress_trigger = Clock.create_trigger(self._flush_sim_progress, 0)
         self._sim_checkpoints_trigger = Clock.create_trigger(self._flush_sim_checkpoints, 0)
         self._pending_checkpoint_vertices: list[int] = []
+        units = vertex_texture_image_units()
+        if units is None:
+            stock_display = RemeshDisplay()
+            self._stock_display_ready = False
+        else:
+            stock_display = select_stock_display(units)
+            self._stock_display_ready = True
         self._stock_simulator = StockSimulator(
             on_meshes_ready=self._on_stock_meshes_ready,
             on_progress=self._on_stock_progress,
             on_checkpoints=self._on_stock_checkpoints,
+            display=stock_display,
         )
         self.bind(dynamic_display=self._on_dynamic_display_changed)
 
@@ -2421,6 +2435,106 @@ class GCodeViewer(Widget):
             except Exception:
                 pass
 
+    def _drop_field_texture(self) -> None:
+        self._field_texture = None
+
+    def _ensure_stock_display(self) -> None:
+        """Probe vertex texture fetch once, after a GL context exists."""
+        if self._stock_display_ready:
+            return
+        units = vertex_texture_image_units()
+        if units is None:
+            return
+        self._stock_display_ready = True
+        display = select_stock_display(units)
+        sim = self._stock_simulator
+        if sim is not None and not sim._enabled:
+            sim._display = display
+
+    def _use_carved_shader(self, kind: str) -> None:
+        if self._carved_shader_kind == kind:
+            return
+        self._clear_carved_meshes()
+        if kind == "field":
+            self.carvedmesh.shader.source = self._carved_field_shader
+            self.carvedmesh["texture2"] = FIELD_TEXTURE_UNIT
+            self.carvedmesh["field_mode"] = 0.0
+            self.carvedmesh["field_size"] = (1.0, 1.0)
+            self.carvedmesh["field_lo"] = 0.0
+            self.carvedmesh["field_span"] = 1.0
+            self.carvedmesh["field_floor"] = 0.0
+            self.carvedmesh["field_cell"] = 1.0
+            self.carvedmesh["field_axis_yz"] = (0.0, 0.0)
+        else:
+            self._drop_field_texture()
+            self.carvedmesh.shader.source = self._carved_stock_shader
+        self.carvedmesh["texture1"] = LASER_DECAL_TEXTURE_UNIT
+        self._carved_shader_kind = kind
+
+    def _blit_field_texture(self, payload: dict) -> None:
+        width = int(payload.get("width") or 0)
+        height = int(payload.get("height") or 0)
+        pixels = payload.get("pixels")
+        if width < 1 or height < 1 or not pixels:
+            return
+        tex = self._field_texture
+        if tex is None or tex.size != (width, height):
+            tex = Texture.create(size=(width, height), colorfmt="rgba", bufferfmt="ubyte")
+            tex.mag_filter = "nearest"
+            tex.min_filter = "nearest"
+            self._field_texture = tex
+        tex.wrap = "clamp_to_edge"
+        tex.blit_buffer(pixels, colorfmt="rgba", bufferfmt="ubyte")
+        self.carvedmesh["texture2"] = FIELD_TEXTURE_UNIT
+
+    def _insert_carved_mesh(self, packed, key) -> None:
+        vertices_mm, indices, fmt = packed
+        mesh = Mesh(fmt=fmt or CARVED_VERTEX_FORMAT, vertices=vertices_mm, indices=indices, mode="triangles")
+        try:
+            anchor_idx = self.carvedmesh.children.index(self._carved_mesh_anchor)
+            self.carvedmesh.insert(anchor_idx + 1, mesh)
+        except (ValueError, AttributeError):
+            self.carvedmesh.add(mesh)
+        self._carved_meshes[key] = mesh
+
+    def _apply_field_payload(self, meshes: dict) -> None:
+        if meshes and "__clear_all__" in meshes:
+            self._apply_stock_meshes(meshes)
+            return
+        self._use_carved_shader("field")
+        body = dict(meshes)
+        laser_payload = None
+        include_laser = False
+        if "__laser__" in body:
+            laser_payload = body.pop("__laser__")
+            include_laser = True
+        payload = body.get("__field__") or {}
+        reveal = self._defer_carved_stock
+        built = payload.get("meshes")
+        if built is not None:
+            self._clear_carved_meshes()
+            for index, packed in enumerate(built):
+                self._insert_carved_mesh(packed, (0, 0, index))
+        if payload:
+            self._blit_field_texture(payload)
+            mode = 2.0 if payload.get("kind") == "cylindrical" else 1.0
+            self.carvedmesh["field_mode"] = mode
+            self.carvedmesh["field_size"] = (float(payload.get("width") or 1), float(payload.get("height") or 1))
+            self.carvedmesh["field_lo"] = float(payload.get("lo") or 0.0)
+            self.carvedmesh["field_span"] = float(payload.get("span") or 1.0)
+            self.carvedmesh["field_floor"] = float(payload.get("floor") or 0.0)
+            self.carvedmesh["field_cell"] = float(payload.get("cell") or 1.0)
+            self.carvedmesh["field_axis_yz"] = (
+                float(payload.get("axis_y") or 0.0),
+                float(payload.get("axis_z") or 0.0),
+            )
+        if include_laser:
+            self._apply_laser_payload(laser_payload)
+        self._update_carved_uniforms()
+        if reveal:
+            self._reveal_carved_stock_if_deferred()
+        self._scene_dirty = True
+
     def _apply_laser_payload(self, payload) -> None:
         if not payload:
             self._drop_laser_texture()
@@ -2442,14 +2556,21 @@ class GCodeViewer(Widget):
     def _setup_carved_gl(self, *_args):
         # Opaque remaining-stock surfaces: depth writes so pocket floors are visible
         # instead of stacking translucent brown layers.
+        self._ensure_stock_display()
         glEnable(GL_DEPTH_TEST)
         glDisable(GL_BLEND)
         glEnable(GL_CULL_FACE)
         glCullFace(GL_BACK)
+        field = self._field_texture
+        if field is not None and self._carved_shader_kind == "field":
+            glActiveTexture(GL_TEXTURE0 + FIELD_TEXTURE_UNIT)
+            field.bind()
         tex = self._laser_texture
         if tex is not None:
             glActiveTexture(GL_TEXTURE0 + LASER_DECAL_TEXTURE_UNIT)
             tex.bind()
+            glActiveTexture(GL_TEXTURE0)
+        else:
             glActiveTexture(GL_TEXTURE0)
 
     def _reset_carved_gl(self, *_args):
@@ -2464,7 +2585,7 @@ class GCodeViewer(Widget):
         def _apply(_dt, meshes=meshes, gen=gen):
             if self._stock_simulator is None or self._stock_simulator.generation != gen:
                 return
-            self._apply_stock_meshes(meshes)
+            self._stock_simulator._display.apply(self, meshes)
 
         Clock.schedule_once(_apply, 0)
 
@@ -2472,10 +2593,13 @@ class GCodeViewer(Widget):
         # Special sentinels from disable / seek-back.
         if meshes and "__clear_all__" in meshes:
             self._drop_laser_texture()
+            self._drop_field_texture()
             self._clear_carved_meshes()
             self._defer_carved_stock = False
             self._scene_dirty = True
             return
+        if getattr(self, "_carved_shader_kind", "stock") != "stock":
+            self._use_carved_shader("stock")
         laser_payload = None
         include_laser = False
         if meshes and "__laser__" in meshes:
@@ -2530,6 +2654,7 @@ class GCodeViewer(Widget):
         self.sim_checkpoints = []
         self._defer_carved_stock = False
         self._drop_laser_texture()
+        self._drop_field_texture()
         self._clear_carved_meshes()
         if not self.simulate_cut or self.stock_bounds_mm is None:
             self._stock_simulator.disable()
