@@ -1,17 +1,15 @@
 name: Build and Release
+# Fork test: build the current branch only. Do not publish releases, packages, or images.
 on:
   push:
     branches:
-      - develop
-    tags:
-      - "v*.*.*"
+      - native-stock-simulation-test-pipeline
 
 jobs:
   build-windows-artifacts:
     name: build-windows-${{ matrix.platform }}
     runs-on: windows-latest
     permissions:
-      actions: read
       contents: read
     strategy:
       fail-fast: false
@@ -20,8 +18,6 @@ jobs:
         include:
           - platform: win64
             arch: x64
-    outputs:
-      unsigned-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
     defaults:
       run:
         shell: bash
@@ -64,17 +60,7 @@ jobs:
         }
         poetry run python scripts/build.py --os windows --version $version
 
-    - name: Upload unsigned artifact for SignPath
-      if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
-      id: upload-unsigned
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-unsigned-${{ matrix.platform }}
-        path: ${{ github.workspace }}/dist/carveracontroller-community-*-windows-x64.exe
-        retention-days: 1
-
     - name: Upload artifact
-      if: ${{ vars.SIGNPATH_ORGANIZATION_ID == '' }}
       uses: actions/upload-artifact@v4
       with:
         name: windows-assets-${{ matrix.platform }}
@@ -131,7 +117,6 @@ jobs:
   build-ios-app:
     name: build-ios
     runs-on: macos-15
-    if: startsWith(github.ref, 'refs/heads/develop')
     defaults:
       run:
         shell: bash
@@ -217,8 +202,6 @@ jobs:
   build-pypi-artifacts:
     name: build-python
     runs-on: ubuntu-24.04
-    permissions:
-      id-token: write
     defaults:
       run:
         shell: bash
@@ -256,19 +239,12 @@ jobs:
         path: ${{ github.workspace }}/dist/*.whl
         retention-days: 2
 
-    - name: Publish package to PyPI
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: pypa/gh-action-pypi-publish@release/v1
-
   build-android-artifacts:
     name: build-android
     runs-on: ubuntu-22.04
     timeout-minutes: 70
     permissions:
-      actions: read
       contents: read
-    outputs:
-      unsigned-artifact-id: ${{ steps.upload-unsigned-apk.outputs.artifact-id }}
     defaults:
       run:
         shell: bash
@@ -332,17 +308,7 @@ jobs:
         fi
         xvfb-run poetry run python scripts/build.py --os android --version "$VERSION" --automation
 
-    - name: Upload unsigned APK for SignPath
-      if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
-      id: upload-unsigned-apk
-      uses: actions/upload-artifact@v4
-      with:
-        name: android-unsigned
-        path: ${{ github.workspace }}/dist/carveracontroller-community-*.apk
-        retention-days: 1
-
     - name: Upload artifact
-      if: ${{ vars.SIGNPATH_ORGANIZATION_ID == '' }}
       uses: actions/upload-artifact@v4
       with:
         name: android-assets
@@ -363,7 +329,6 @@ jobs:
             image: ubuntu-24.04-arm
     permissions:
       contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -386,13 +351,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -403,242 +361,11 @@ jobs:
             type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'develop') }}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push Docker image
+      - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
           context: assets/packaging/Docker
-          push: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/${{ matrix.platform == 'x64' && 'amd64' || matrix.platform }}
-
-  sign-artifacts:
-    name: sign-artifacts
-    needs: [build-windows-artifacts, build-android-artifacts]
-    if: ${{ always() && !cancelled() && vars.SIGNPATH_ORGANIZATION_ID != '' && (needs.build-windows-artifacts.result == 'success' || needs.build-android-artifacts.result == 'success') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 270
-    permissions:
-      actions: read
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    env:
-      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG || 'carvera-controller-community' }}
-      # TODO: restore release-signing for tags after release-signing is setup
-      SIGNPATH_SIGNING_POLICY_SLUG: test-signing
-      SIGNPATH_WINDOWS_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_WINDOWS_ARTIFACT_CONFIGURATION_SLUG || 'windows-portable-exe' }}
-      SIGNPATH_ANDROID_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ANDROID_ARTIFACT_CONFIGURATION_SLUG || 'android-apk' }}
-    steps:
-    - name: Submit Windows SignPath signing request
-      if: ${{ needs.build-windows-artifacts.result == 'success' }}
-      id: signpath-windows
-      uses: signpath/github-action-submit-signing-request@v2
-      with:
-        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-        organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-        project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
-        signing-policy-slug: ${{ env.SIGNPATH_SIGNING_POLICY_SLUG }}
-        artifact-configuration-slug: ${{ env.SIGNPATH_WINDOWS_ARTIFACT_CONFIGURATION_SLUG }}
-        github-artifact-id: ${{ needs.build-windows-artifacts.outputs.unsigned-artifact-id }}
-        wait-for-completion: false
-
-    - name: Submit Android SignPath signing request
-      if: ${{ always() && !cancelled() && needs.build-android-artifacts.result == 'success' }}
-      id: signpath-apk
-      uses: signpath/github-action-submit-signing-request@v2
-      with:
-        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-        organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-        project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
-        signing-policy-slug: ${{ env.SIGNPATH_SIGNING_POLICY_SLUG }}
-        artifact-configuration-slug: ${{ env.SIGNPATH_ANDROID_ARTIFACT_CONFIGURATION_SLUG }}
-        github-artifact-id: ${{ needs.build-android-artifacts.outputs.unsigned-artifact-id }}
-        wait-for-completion: false
-
-
-    - name: Wait for SignPath signing and download artifacts
-      if: ${{ always() && !cancelled() && (steps.signpath-windows.outputs.signing-request-id != '' || steps.signpath-apk.outputs.signing-request-id != '') }}
-      env:
-        SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-        SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-        WINDOWS_REQUEST_ID: ${{ steps.signpath-windows.outputs.signing-request-id }}
-        ANDROID_REQUEST_ID: ${{ steps.signpath-apk.outputs.signing-request-id }}
-        WAIT_TIMEOUT_SECONDS: "14400"
-      run: |
-        set -euo pipefail
-        connector="https://githubactions.connectors.signpath.io"
-        org="${SIGNPATH_ORGANIZATION_ID}"
-        deadline=$((SECONDS + WAIT_TIMEOUT_SECONDS))
-        names=()
-        ids=()
-        outdirs=()
-        states=()
-        if [ -n "${WINDOWS_REQUEST_ID}" ]; then
-          names+=("Windows")
-          ids+=("${WINDOWS_REQUEST_ID}")
-          outdirs+=("${GITHUB_WORKSPACE}/signed-windows")
-          states+=("pending")
-        fi
-        if [ -n "${ANDROID_REQUEST_ID}" ]; then
-          names+=("Android")
-          ids+=("${ANDROID_REQUEST_ID}")
-          outdirs+=("${GITHUB_WORKSPACE}/signed-android")
-          states+=("pending")
-        fi
-
-        pending_count() {
-          local count=0
-          local state
-          for state in "${states[@]}"; do
-            if [ "${state}" = "pending" ]; then
-              count=$((count + 1))
-            fi
-          done
-          echo "${count}"
-        }
-
-        while [ "$(pending_count)" -gt 0 ]; do
-          if [ "${SECONDS}" -ge "${deadline}" ]; then
-            echo "Timed out after ${WAIT_TIMEOUT_SECONDS}s waiting for: ${names[*]}" >&2
-            exit 1
-          fi
-          for i in "${!names[@]}"; do
-            if [ "${states[$i]}" != "pending" ]; then
-              continue
-            fi
-            if ! body="$(curl -sS --fail -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
-              "${connector}/${org}/SigningRequests/${ids[$i]}/Status?api-version=1.0")"; then
-              echo "${names[$i]} status check failed; will retry"
-              continue
-            fi
-            status="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")' <<<"${body}")"
-            is_final="$(python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("isFinalStatus", False)).lower())' <<<"${body}")"
-            echo "${names[$i]} status: ${status} final=${is_final}"
-            if [ "${is_final}" != "true" ]; then
-              continue
-            fi
-            if [ "${status}" != "Completed" ]; then
-              echo "${names[$i]} signing ended with status ${status}" >&2
-              echo "${body}" >&2
-              states[$i]="failed"
-              continue
-            fi
-            mkdir -p "${outdirs[$i]}"
-            curl -sS --fail -L -H "Authorization: Bearer ${SIGNPATH_API_TOKEN}" \
-              -o "${outdirs[$i]}/signed.zip" \
-              "${connector}/${org}/SigningRequests/${ids[$i]}/SignedArtifact?api-version=1.0"
-            unzip -o "${outdirs[$i]}/signed.zip" -d "${outdirs[$i]}"
-            echo "Downloaded and extracted ${names[$i]} signed artifact"
-            states[$i]="completed"
-          done
-          if [ "$(pending_count)" -gt 0 ]; then
-            sleep 15
-          fi
-        done
-
-        failures=()
-        for i in "${!names[@]}"; do
-          if [ "${states[$i]}" != "completed" ]; then
-            failures+=("${names[$i]}")
-          fi
-        done
-        if [ "${#failures[@]}" -ne 0 ]; then
-          echo "Signing failed for: ${failures[*]}" >&2
-          exit 1
-        fi
-
-    - name: Stage signed Windows EXE
-      if: ${{ always() && !cancelled() && steps.signpath-windows.outputs.signing-request-id != '' }}
-      run: |
-        set -euo pipefail
-        mkdir -p dist
-        signed="$(find "${GITHUB_WORKSPACE}/signed-windows" -type f -name 'carveracontroller-community-*-windows-x64.exe' | head -n 1)"
-        if [ -z "${signed}" ]; then
-          echo "Signed Windows EXE was not returned by SignPath" >&2
-          find "${GITHUB_WORKSPACE}/signed-windows" -print >&2 || true
-          exit 1
-        fi
-        cp "${signed}" "${GITHUB_WORKSPACE}/dist/"
-        echo "Copied signed EXE: ${signed}"
-
-    - name: Upload signed Windows artifact
-      if: ${{ always() && !cancelled() && steps.signpath-windows.outputs.signing-request-id != '' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows-assets-win64
-        path: ${{ github.workspace }}/dist/carveracontroller-community-*-windows-x64.exe
-        retention-days: 2
-
-    - name: Stage signed Android APK
-      if: ${{ always() && !cancelled() && steps.signpath-apk.outputs.signing-request-id != '' }}
-      run: |
-        set -euo pipefail
-        mkdir -p dist
-        signed_apk="$(find "${GITHUB_WORKSPACE}/signed-android" -type f -name 'carveracontroller-community-*.apk' | head -n 1)"
-        if [ -z "${signed_apk}" ]; then
-          echo "Signed Android APK was not returned by SignPath" >&2
-          find "${GITHUB_WORKSPACE}/signed-android" -print >&2 || true
-          exit 1
-        fi
-        cp "${signed_apk}" "${GITHUB_WORKSPACE}/dist/"
-        echo "Copied signed APK: ${signed_apk}"
-
-    - name: Upload signed Android artifact
-      if: ${{ always() && !cancelled() && steps.signpath-apk.outputs.signing-request-id != '' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: android-assets
-        path: ${{ github.workspace }}/dist/carveracontroller-community-*.apk
-        retention-days: 2
-
-  publish-release:
-    needs: [ build-windows-artifacts, build-macos-artifacts, build-linux-artifacts, build-pypi-artifacts, build-android-artifacts, sign-artifacts ]
-    if: ${{ always() && !cancelled() && (needs.build-windows-artifacts.result == 'success' || needs.build-macos-artifacts.result == 'success' || needs.build-linux-artifacts.result == 'success' || needs.build-pypi-artifacts.result == 'success' || needs.build-android-artifacts.result == 'success') }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      # Deleting the old dev release means that on the Publish release step a new dev release is created putting it in the right chronological order
-      - name: Delete old dev release (dev builds only)  
-        if: startsWith(github.ref, 'refs/heads/develop')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Check if dev release exists and delete it
-          if gh release view dev --repo ${{ github.repository }} 2>/dev/null; then
-            gh release delete dev --repo ${{ github.repository }} --yes
-          fi
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:  # Skip downloading docker images
-          pattern: '*-assets*'
-
-      - name: Generate dev release notes (dev builds only)
-        if: startsWith(github.ref, 'refs/heads/develop')
-        run: python3 ./scripts/dev_release_notes.py
-
-      - name: Force move 'dev' tag to latest commit on develop (dev builds only)
-        if: startsWith(github.ref, 'refs/heads/develop')
-        run: |
-          git tag -f dev
-          git push origin dev --force
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2.2.2
-        with:
-          fail_on_unmatched_files: false
-          files: |
-            windows-assets-*/carveracontroller-community-*-windows-x64.exe
-            macos-assets-*/carveracontroller-community-*.dmg
-            linux-assets-*/carveracontroller-community-*.appimage
-            pypi-assets/*.whl
-            android-assets/carveracontroller-community-*.apk
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-          body_path: ${{ startsWith(github.ref, 'refs/tags/') && 'CHANGELOG.md' || 'dev-CHANGELOG.md' }} 
-          prerelease: ${{ startsWith(github.ref, 'refs/tags/') && 'false' || 'true' }}
- 
