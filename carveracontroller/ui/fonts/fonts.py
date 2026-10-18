@@ -4,8 +4,8 @@ Kivy's SDL2 provider resolves ``font_name`` to a registered alias or a font
 file. It does not look up a family name. This module does that lookup and
 returns an alias whose four slots (regular, italic, bold, bold italic) are
 files of the chosen face: fontconfig on Linux, the font registry on Windows,
-Core Text on macOS, and the system font configuration on Android. A collection
-face other than 0 is left out, because Kivy opens face 0.
+Core Text on macOS and iOS, and the system font configuration on Android. A
+collection face other than 0 is left out, because Kivy opens face 0.
 """
 
 from __future__ import annotations
@@ -431,6 +431,20 @@ def _windows_font_index() -> dict[str, tuple[FontFace, ...]]:
 _CF_STRING_UTF8 = 0x08000100
 
 
+def _load_apple_framework(name: str):
+    """Core Text or Core Foundation.
+
+    macOS has the binary on disk. iOS serves the same framework from the dyld
+    shared cache, which opens by framework name when the absolute path does not.
+    """
+    absolute = f"/System/Library/Frameworks/{name}.framework/{name}"
+    try:
+        return ctypes.cdll.LoadLibrary(absolute)
+    except OSError:
+        logger.debug("Could not open %s; trying the framework name", absolute, exc_info=True)
+        return ctypes.cdll.LoadLibrary(name)
+
+
 def _cf_string(core_foundation, text: str):
     return core_foundation.CFStringCreateWithCString(None, text.encode("utf-8"), _CF_STRING_UTF8)
 
@@ -449,8 +463,8 @@ def _py_string(core_foundation, ref) -> str:
 def _macos_descriptor_records() -> list[tuple[str, str, str, int]] | None:
     """Every file-backed face Core Text publishes, or ``None`` when the call fails."""
     try:
-        core_text = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreText.framework/CoreText")
-        core_foundation = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        core_text = _load_apple_framework("CoreText")
+        core_foundation = _load_apple_framework("CoreFoundation")
     except OSError:
         return None
     pointer = ctypes.c_void_p
@@ -522,8 +536,8 @@ def _macos_font_records() -> list[tuple[str, str, str, int]]:
     described = _macos_descriptor_records()
     if described is not None:
         return described
-    core_text = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreText.framework/CoreText")
-    core_foundation = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    core_text = _load_apple_framework("CoreText")
+    core_foundation = _load_apple_framework("CoreFoundation")
     pointer = ctypes.c_void_p
     index_type = ctypes.c_long
     boolean = ctypes.c_uint8
@@ -947,7 +961,7 @@ def _android_directory_faces(font_dirs: tuple[str, ...]) -> list[tuple[str, int,
         try:
             names = sorted(os.listdir(directory))
         except OSError:
-            logger.debug("Android font directory unavailable: %s", directory, exc_info=True)
+            logger.debug("Font directory unavailable: %s", directory, exc_info=True)
             continue
         for name in names:
             path = os.path.join(directory, name)
@@ -1011,12 +1025,49 @@ def _android_font_index(
     return index
 
 
+# Loose files, then the folders current iOS releases actually use.
+_IOS_FONT_DIRS = (
+    "/System/Library/Fonts",
+    "/System/Library/Fonts/Core",
+    "/System/Library/Fonts/CoreAddition",
+    "/System/Library/Fonts/LanguageSupport",
+    "/System/Library/Fonts/AppFonts",
+)
+
+
+def _ios_font_index(font_dirs: tuple[str, ...] | None = None) -> dict[str, tuple[FontFace, ...]]:
+    """Installed faces on iOS.
+
+    Core Text names each file-backed face. When that list is empty, the system
+    font directories are read by filename and name table, the same way an
+    Android device with no ``fonts.xml`` is read.
+    """
+    index = _macos_font_index()
+    if index:
+        return index
+    chosen_dirs = _IOS_FONT_DIRS if font_dirs is None else font_dirs
+    try:
+        records = [
+            (family, _android_style(weight, italic), path, 0)
+            for family, weight, italic, path in _collapse_android_faces(_android_directory_faces(chosen_dirs))
+        ]
+        index = _index_from_records(records, trust_face=True)
+    except (OSError, ValueError):
+        logger.warning("iOS font directory scan failed", exc_info=True)
+        return {}
+    if not index:
+        logger.warning("No iOS system fonts found; the font list will only offer %s", ARIALUNI)
+    return index
+
+
 def _load_font_index() -> dict | None:
     """Installed faces, or ``None`` when the scan should be retried."""
-    from carveracontroller.main import is_android
+    from carveracontroller.main import is_android, is_ios
 
     if is_android():
         return _android_font_index()
+    if is_ios() or sys.platform == "ios":
+        return _ios_font_index()
     if sys.platform == "win32":
         return _windows_font_index()
     if sys.platform == "darwin":

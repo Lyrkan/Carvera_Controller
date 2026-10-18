@@ -15,6 +15,7 @@ from carveracontroller.ui.themes import BASE_THEME
 _REAL_FONT_SCAN = {
     "test_scan_follows_the_platform",
     "test_android_environment_uses_the_android_scanner",
+    "test_ios_environment_uses_the_ios_scanner",
 }
 
 
@@ -307,7 +308,7 @@ def test_collection_keeps_only_the_family_of_face_zero(tmp_path, monkeypatch):
     [("win32", "_windows_font_index"), ("darwin", "_macos_font_index"), ("linux", "_fontconfig_index")],
 )
 def test_scan_follows_the_platform(monkeypatch, platform_name, loader):
-    for key in ("ANDROID_ARGUMENT", "ANDROID_PRIVATE", "ANDROID_APP_PATH"):
+    for key in ("ANDROID_ARGUMENT", "ANDROID_PRIVATE", "ANDROID_APP_PATH", "KIVY_BUILD"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(fonts.sys, "platform", platform_name)
     monkeypatch.setattr(fonts, loader, lambda: {"Named": "named.ttf"})
@@ -322,6 +323,20 @@ def test_android_environment_uses_the_android_scanner(monkeypatch):
     monkeypatch.setattr(fonts, "_android_font_index", lambda: {"Roboto": "roboto.ttf"})
     monkeypatch.setattr(fonts, "_fontconfig_index", lambda: {"DejaVu Sans": "dejavu.ttf"})
     assert fonts._load_font_index() == {"Roboto": "roboto.ttf"}
+
+
+def test_ios_environment_uses_the_ios_scanner(monkeypatch):
+    import carveracontroller.main  # noqa: F401  # load before the env var is set
+
+    monkeypatch.setattr(fonts.sys, "platform", "ios")
+    monkeypatch.delenv("KIVY_BUILD", raising=False)
+    monkeypatch.setattr(fonts, "_ios_font_index", lambda: {"Helvetica": "helvetica.ttc"})
+    monkeypatch.setattr(fonts, "_fontconfig_index", lambda: {"DejaVu Sans": "dejavu.ttf"})
+    assert fonts._load_font_index() == {"Helvetica": "helvetica.ttc"}
+
+    monkeypatch.setattr(fonts.sys, "platform", "linux")
+    monkeypatch.setenv("KIVY_BUILD", "ios")
+    assert fonts._load_font_index() == {"Helvetica": "helvetica.ttc"}
 
 
 def test_italic_only_style_is_regular_italic():
@@ -520,6 +535,36 @@ def test_android_legacy_fileset_assigns_the_four_faces(tmp_path):
 
 def test_android_scan_warns_when_no_fonts_can_be_read(tmp_path, caplog):
     index = fonts._android_font_index((str(tmp_path / "missing.xml"),), (str(tmp_path),))
+    assert index == {}
+    assert "ARIALUNI" in caplog.text
+
+
+def test_ios_keeps_the_core_text_list(monkeypatch, tmp_path):
+    font_dir = tmp_path / "Fonts"
+    font_dir.mkdir()
+    (font_dir / "Helvetica.ttc").write_bytes(_sfnt_font(((16, "Helvetica"),)))
+    monkeypatch.setattr(fonts, "_macos_font_index", lambda: {"Helvetica Neue": "neue.ttc"})
+
+    assert fonts._ios_font_index((str(font_dir),)) == {"Helvetica Neue": "neue.ttc"}
+
+
+def test_ios_without_core_text_reads_the_font_directory(monkeypatch, tmp_path):
+    font_dir = tmp_path / "Core"
+    font_dir.mkdir()
+    (font_dir / "Helvetica.ttc").write_bytes(_sfnt_font(((16, "Helvetica"),)))
+    (font_dir / "Helvetica-Bold.ttf").write_bytes(_sfnt_font(((16, "Helvetica"),)))
+    (font_dir / "AppleColorEmoji.ttc").write_bytes(_sfnt_font(((16, "Apple Color Emoji"),)))
+    monkeypatch.setattr(fonts, "_macos_font_index", lambda: {})
+
+    index = fonts._ios_font_index((str(font_dir),))
+    assert set(index) == {"Helvetica"}
+    assert _face_path(index, "Helvetica") == str(font_dir / "Helvetica.ttc")
+    assert _face_path(index, "Helvetica", "Bold") == str(font_dir / "Helvetica-Bold.ttf")
+
+
+def test_ios_scan_warns_when_no_fonts_can_be_read(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(fonts, "_macos_font_index", lambda: {})
+    index = fonts._ios_font_index((str(tmp_path),))
     assert index == {}
     assert "ARIALUNI" in caplog.text
 
