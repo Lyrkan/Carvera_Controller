@@ -1,6 +1,7 @@
 """Theme fonts: resolving a name or path to a Kivy ``font_name``."""
 
 import os
+import struct
 import subprocess
 
 import pytest
@@ -11,13 +12,18 @@ from carveracontroller.ui.fonts.fonts import ARIALUNI, arialuni_path, resolve_fo
 from carveracontroller.ui.theme import Theme
 from carveracontroller.ui.themes import BASE_THEME
 
+_REAL_FONT_SCAN = {
+    "test_scan_follows_the_platform",
+    "test_android_environment_uses_the_android_scanner",
+}
+
 
 @pytest.fixture(autouse=True)
 def no_system_fonts(monkeypatch, request):
     """Keep the tests independent of the fonts installed on the machine."""
     fonts._index_cache = None
-    # That test checks which scanner each system uses, so it keeps the real one.
-    if request.node.originalname != "test_scan_follows_the_platform":
+    # Those tests check which scanner each system uses, so they keep the real one.
+    if request.node.originalname not in _REAL_FONT_SCAN:
         monkeypatch.setattr(fonts, "_load_font_index", lambda: {})
     yield
     fonts._index_cache = None
@@ -301,9 +307,221 @@ def test_collection_keeps_only_the_family_of_face_zero(tmp_path, monkeypatch):
     [("win32", "_windows_font_index"), ("darwin", "_macos_font_index"), ("linux", "_fontconfig_index")],
 )
 def test_scan_follows_the_platform(monkeypatch, platform_name, loader):
+    for key in ("ANDROID_ARGUMENT", "ANDROID_PRIVATE", "ANDROID_APP_PATH"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(fonts.sys, "platform", platform_name)
     monkeypatch.setattr(fonts, loader, lambda: {"Named": "named.ttf"})
     assert fonts._load_font_index() == {"Named": "named.ttf"}
+
+
+def test_android_environment_uses_the_android_scanner(monkeypatch):
+    import carveracontroller.main  # noqa: F401  # load before the env var is set
+
+    monkeypatch.setattr(fonts.sys, "platform", "linux")
+    monkeypatch.setenv("ANDROID_ARGUMENT", "1")
+    monkeypatch.setattr(fonts, "_android_font_index", lambda: {"Roboto": "roboto.ttf"})
+    monkeypatch.setattr(fonts, "_fontconfig_index", lambda: {"DejaVu Sans": "dejavu.ttf"})
+    assert fonts._load_font_index() == {"Roboto": "roboto.ttf"}
+
+
+def test_italic_only_style_is_regular_italic():
+    assert fonts._classify_style("Italic") == ("Regular", True, 0)
+    assert fonts._classify_style("Oblique") == ("Regular", True, 0)
+    assert fonts._classify_style("Condensed Italic") == ("Regular", True, 1)
+    assert fonts._classify_style("Condensed") is None
+
+
+def _sfnt_font(names: tuple[tuple[int, str], ...], origin: int = 0) -> bytes:
+    """Minimal TrueType whose name table holds Windows English ``(name_id, text)`` records."""
+    strings = b""
+    records = b""
+    for name_id, text in names:
+        encoded = text.encode("utf-16-be")
+        records += struct.pack(">HHHHHH", 3, 1, 0x0409, name_id, len(encoded), len(strings))
+        strings += encoded
+    string_offset = 6 + len(names) * 12
+    table = struct.pack(">HHH", 0, len(names), string_offset) + records + strings
+    directory = b"name" + struct.pack(">III", 0, origin + 28, len(table))
+    header = b"\x00\x01\x00\x00" + struct.pack(">HHHH", 1, 16, 0, 0)
+    return header + directory + table
+
+
+def _sfnt_collection(names: tuple[tuple[int, str], ...]) -> bytes:
+    return b"ttcf" + struct.pack(">III", 0x00010000, 1, 16) + _sfnt_font(names, origin=16)
+
+
+def test_sfnt_family_prefers_the_typographic_name_and_reads_a_collection(tmp_path):
+    legacy = tmp_path / "Legacy-Bold.ttf"
+    legacy.write_bytes(_sfnt_font(((1, "Roboto Bold"),)))
+    assert fonts._sfnt_family(str(legacy)) == "Roboto"
+
+    named = tmp_path / "Named.ttf"
+    named.write_bytes(_sfnt_font(((1, "Roboto Bold"), (16, "Roboto"))))
+    assert fonts._sfnt_family(str(named)) == "Roboto"
+
+    collection = tmp_path / "NotoSansCJK-Regular.ttc"
+    collection.write_bytes(_sfnt_collection(((16, "Noto Sans CJK JP"),)))
+    assert fonts._sfnt_family(str(collection)) == "Noto Sans CJK JP"
+    assert fonts._sfnt_family(str(tmp_path / "missing.ttf")) is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "family"),
+    [
+        ("Roboto-Regular.ttf", "Roboto"),
+        ("Roboto-BoldItalic.ttf", "Roboto"),
+        ("RobotoSemiBold.ttf", "Roboto"),
+        ("NotoSerif-Regular.ttf", "Noto Serif"),
+        ("NotoSansCJK-Regular.ttc", "Noto Sans CJK"),
+        ("DroidSansMono.ttf", "Droid Sans Mono"),
+        ("GoogleSans-Medium.ttf", "Google Sans"),
+        ("ComingSoon.ttf", "Coming Soon"),
+        ("RobotoCondensed-Regular.ttf", "Roboto Condensed"),
+        ("Facebook.ttf", "Facebook"),
+    ],
+)
+def test_family_from_filename_drops_the_style_and_keeps_the_rest(filename, family):
+    assert fonts._family_from_filename(filename) == family
+
+
+def test_android_font_config_lists_system_families(tmp_path):
+    font_dir = tmp_path / "fonts"
+    font_dir.mkdir()
+    files = {
+        "Roboto-Regular.ttf": ((16, "Roboto"),),
+        "Roboto-Bold.ttf": ((16, "Roboto"),),
+        "Roboto-Italic.ttf": ((16, "Roboto"),),
+        "RobotoCondensed-Regular.ttf": ((16, "Roboto Condensed"),),
+        "NotoSerif-Regular.ttf": ((1, "Noto Serif"),),
+        "NotoColorEmoji.ttf": ((16, "Noto Color Emoji"),),
+        "NotoSansCJK-Regular.ttc": ((16, "Noto Sans CJK JP"),),
+        "RobotoFlex.ttf": ((16, "Roboto Flex"),),
+        "GoogleSans-Regular.ttf": ((16, "Google Sans"),),
+    }
+    for name, records in files.items():
+        blob = _sfnt_collection(records) if name.endswith(".ttc") else _sfnt_font(records)
+        (font_dir / name).write_bytes(blob)
+    outside = tmp_path / "DancingScript-Regular.ttf"
+    outside.write_bytes(_sfnt_font(((16, "Dancing Script"),)))
+
+    config = tmp_path / "fonts.xml"
+    config.write_text(
+        f"""<?xml version="1.0"?>
+        <familyset version="23">
+            <family name="sans-serif">
+                <font weight="400" style="normal">Roboto-Regular.ttf</font>
+                <font weight="400" style="italic">Roboto-Italic.ttf</font>
+                <font weight="700" style="normal">Roboto-Bold.ttf</font>
+                <font weight="400" style="normal" index="2">NotoSansCJK-Regular.ttc</font>
+            </family>
+            <family name="sans-serif-condensed">
+                <font weight="400" style="normal">RobotoCondensed-Regular.ttf</font>
+            </family>
+            <family lang="und-Arab">
+                <font weight="400" style="normal">NotoSerif-Regular.ttf</font>
+            </family>
+            <family>
+                <font weight="400" style="normal">NotoColorEmoji.ttf</font>
+            </family>
+            <family lang="ja">
+                <font weight="400" style="normal" index="0">NotoSansCJK-Regular.ttc</font>
+            </family>
+            <family name="sans-serif-flex">
+                <font weight="100" style="normal">RobotoFlex.ttf
+                    <axis tag="wght" stylevalue="100.0"/>
+                </font>
+                <font weight="400" style="normal">RobotoFlex.ttf</font>
+                <font weight="700" style="normal">RobotoFlex.ttf</font>
+            </family>
+            <family name="casual">
+                <font weight="400" style="normal">{outside}</font>
+            </family>
+            <alias name="sans-serif-medium" to="sans-serif" weight="500"/>
+            <family name="missing">
+                <font weight="400" style="normal">NotThere.ttf</font>
+            </family>
+        </familyset>
+        """
+    )
+    overlay = tmp_path / "fonts_customization.xml"
+    overlay.write_text(
+        """
+        <fonts-modification version="1">
+            <family customizationType="new-named-family" name="google-sans">
+                <font weight="400" style="normal">GoogleSans-Regular.ttf</font>
+            </family>
+        </fonts-modification>
+        """
+    )
+    index = fonts._android_font_index((str(config), str(overlay)), (str(font_dir),))
+
+    assert set(index) == {
+        "Roboto",
+        "Roboto Condensed",
+        "Noto Serif",
+        "Noto Sans CJK JP",
+        "Roboto Flex",
+        "Dancing Script",
+        "Google Sans",
+    }
+    assert _face_path(index, "Roboto") == str(font_dir / "Roboto-Regular.ttf")
+    assert _face_path(index, "Roboto", "Bold") == str(font_dir / "Roboto-Bold.ttf")
+    assert _face_path(index, "Roboto", italic=True) == str(font_dir / "Roboto-Italic.ttf")
+    assert fonts.available_weights("Roboto", index) == ["Regular", "Bold"]
+    assert fonts.available_styles("Roboto", "Regular", index) == ["Roman", "Italic"]
+    assert fonts.available_weights("Roboto Flex", index) == ["Regular"]
+    assert _face_path(index, "Dancing Script") == str(outside)
+    assert _face_path(index, "Google Sans") == str(font_dir / "GoogleSans-Regular.ttf")
+
+
+def test_android_without_a_config_reads_the_font_directory(tmp_path):
+    font_dir = tmp_path / "fonts"
+    font_dir.mkdir()
+    (font_dir / "Roboto-Regular.ttf").write_bytes(_sfnt_font(((16, "Roboto"),)))
+    (font_dir / "Roboto-BoldItalic.ttf").write_bytes(_sfnt_font(((16, "Roboto"),)))
+    (font_dir / "NotoColorEmoji.ttf").write_bytes(_sfnt_font(((16, "Noto Color Emoji"),)))
+    (font_dir / "notes.txt").write_text("nope")
+    broken = tmp_path / "broken.xml"
+    broken.write_text("<fonts")
+
+    index = fonts._android_font_index((str(broken), str(tmp_path / "missing.xml")), (str(font_dir),))
+    assert set(index) == {"Roboto"}
+    assert _face_path(index, "Roboto") == str(font_dir / "Roboto-Regular.ttf")
+    assert _face_path(index, "Roboto", "Bold", italic=True) == str(font_dir / "Roboto-BoldItalic.ttf")
+
+
+def test_android_legacy_fileset_assigns_the_four_faces(tmp_path):
+    font_dir = tmp_path / "fonts"
+    font_dir.mkdir()
+    for name in ("Regular.ttf", "Bold.ttf", "Italic.ttf", "BoldItalic.ttf"):
+        (font_dir / name).write_bytes(_sfnt_font(((16, "Roboto"),)))
+    config = tmp_path / "system_fonts.xml"
+    config.write_text(
+        """
+        <familyset>
+            <family>
+                <nameset><name>sans-serif</name></nameset>
+                <fileset>
+                    <file>Regular.ttf</file>
+                    <file>Bold.ttf</file>
+                    <file>Italic.ttf</file>
+                    <file>BoldItalic.ttf</file>
+                </fileset>
+            </family>
+        </familyset>
+        """
+    )
+    index = fonts._android_font_index((str(config),), (str(font_dir),))
+    assert _face_path(index, "Roboto") == str(font_dir / "Regular.ttf")
+    assert _face_path(index, "Roboto", "Bold") == str(font_dir / "Bold.ttf")
+    assert _face_path(index, "Roboto", italic=True) == str(font_dir / "Italic.ttf")
+    assert _face_path(index, "Roboto", "Bold", italic=True) == str(font_dir / "BoldItalic.ttf")
+
+
+def test_android_scan_warns_when_no_fonts_can_be_read(tmp_path, caplog):
+    index = fonts._android_font_index((str(tmp_path / "missing.xml"),), (str(tmp_path),))
+    assert index == {}
+    assert "ARIALUNI" in caplog.text
 
 
 def test_frozen_bundle_uses_meipass_or_the_executable_directory(monkeypatch, tmp_path):
