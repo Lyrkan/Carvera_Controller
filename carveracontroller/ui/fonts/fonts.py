@@ -236,6 +236,15 @@ def split_font_spec(spec) -> tuple[str, str, str]:
     return normalized["family"], normalized["weight"], normalized["style"]
 
 
+def _is_font_path(value: str) -> bool:
+    """A theme value that names a file, not a family."""
+    return "/" in value or "\\" in value or value.lower().endswith(FONT_EXTENSIONS)
+
+
+def _is_font_file(path: str) -> bool:
+    return os.path.isfile(path) and path.lower().endswith(FONT_EXTENSIONS)
+
+
 def font_choice(family: str, weight: str, style: str):
     """Theme value for a family at ``weight`` and ``style``.
 
@@ -309,6 +318,7 @@ def _index_from_records(
     }
 
 
+# Linux. A timeout is not cached, so the next lookup tries ``fc-list`` again.
 def _parse_fc_list(stdout: str) -> list[tuple[str, str, str, int]]:
     """Rows from ``fc-list -f '%{family[0]}|%{style[0]}|%{file}|%{index}'``."""
     records = []
@@ -360,6 +370,8 @@ def _fontconfig_index() -> dict[str, tuple[FontFace, ...]] | None:
     return _index_from_records(_parse_fc_list(_decode_fc_list(result.stdout)), trust_face=True)
 
 
+# Windows. Entries are read from the machine hive, then the user hive, so a
+# per-user font overrides the same family.
 def _split_registry_name(value_name: str) -> tuple[str, str] | None:
     """``(family, style)`` from a Windows font-registry value name."""
     name = re.sub(r"\s*\([^)]*\)\s*$", "", value_name).strip()
@@ -428,6 +440,7 @@ def _windows_font_index() -> dict[str, tuple[FontFace, ...]]:
     return _index_from_records(_records_from_registry(entries, fonts_dir))
 
 
+# macOS, and iOS when Core Text can list the file behind each face.
 _CF_STRING_UTF8 = 0x08000100
 
 
@@ -615,19 +628,9 @@ def _macos_font_index() -> dict[str, tuple[FontFace, ...]]:
     return _index_from_records(records)
 
 
-# Base config, then product and OEM overlays. Later files add families.
-_ANDROID_FONT_CONFIGS = (
-    "/system/etc/fonts.xml",
-    "/product/etc/fonts_customization.xml",
-    "/system_ext/etc/fonts_customization.xml",
-    "/oem/etc/fonts_customization.xml",
-)
-_ANDROID_FONT_DIRS = (
-    "/system/fonts",
-    "/product/fonts",
-    "/system_ext/fonts",
-    "/oem/fonts",
-)
+# Family and weight read from the font file itself. Android uses this when
+# its font configuration cannot be read, and iOS uses it when Core Text
+# returns nothing.
 
 # A filename may glue a style on in camel case (Roboto-BoldItalic, RobotoSemiBold).
 # Longest first, so BoldItalic is not read as Italic.
@@ -673,92 +676,79 @@ def _style_compacts() -> set[str]:
 _STYLE_CHUNK_COMPACT = _style_compacts()
 
 
-def _xml_local(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1]
+def _camel_words(text: str) -> list[str]:
+    return re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+", text)
 
 
-def _nearest_weight_name(weight: int) -> str:
-    return min(_WEIGHT_ORDER, key=lambda name: (abs(_WEIGHT_ORDER[name] - weight), _WEIGHT_ORDER[name]))
+def _chunk_is_only_style(chunk: str) -> bool:
+    return _normalize(chunk) in _STYLE_CHUNK_COMPACT
 
 
-def _android_style(weight: int, italic: bool) -> str:
-    name = _nearest_weight_name(weight)
-    if not italic:
-        return name
-    if name == WEIGHT_REGULAR:
-        return "Italic"
-    return f"{name} Italic"
-
-
-def _is_emoji_family(name: str) -> bool:
-    return "emoji" in name.casefold()
-
-
-def _resolve_android_font(name: str, font_dirs: tuple[str, ...]) -> str | None:
-    """A config's font filename, under one of the system font directories."""
-    name = name.strip().strip("\x00")
-    if not name or "emoji" in os.path.basename(name).casefold():
-        return None
-    if os.path.isabs(name):
-        return name if _is_font_file(name) else None
-    if os.path.basename(name) != name:
-        return None
-    for directory in font_dirs:
-        path = os.path.join(directory, name)
-        if _is_font_file(path):
-            return path
-    return None
-
-
-def _elements_named(family: ET.Element, tag: str) -> list[ET.Element]:
-    """``tag`` elements inside one family. Legacy files sit under ``<fileset>``."""
-    return [child for child in family.iter() if child is not family and _xml_local(child.tag) == tag]
-
-
-def _android_font_children(family: ET.Element) -> list[tuple[int, bool, str, int]]:
-    """``(weight, italic, filename, face)`` from ``<font>`` or legacy ``<file>`` children."""
-    fonts = _elements_named(family, "font")
-    if fonts:
-        rows = []
-        for font in fonts:
-            filename = (font.text or "").strip()
-            try:
-                face = int(font.get("index") or "0")
-            except ValueError:
+def _strip_glued_style(chunk: str) -> str:
+    changed = True
+    while changed and chunk:
+        changed = False
+        for suffix in _CAMEL_STYLE_SUFFIXES:
+            if len(chunk) <= len(suffix) or not chunk.endswith(suffix):
                 continue
-            try:
-                weight = int(font.get("weight") or "400")
-            except ValueError:
-                weight = 400
-            style = (font.get("style") or "normal").strip().casefold()
-            rows.append((weight, style in _ITALIC_WORDS, filename, face))
-        return rows
-    # Pre-Lollipop system_fonts.xml lists regular, bold, italic, bold italic.
-    files = _elements_named(family, "file")
-    legacy = ((400, False), (700, False), (400, True), (700, True))
-    return [(weight, italic, (child.text or "").strip(), 0) for child, (weight, italic) in zip(files, legacy)]
+            boundary = chunk[-len(suffix) - 1]
+            if boundary.islower() or boundary.isdigit():
+                chunk = chunk[: -len(suffix)]
+                changed = True
+                break
+    return chunk
 
 
-def _android_config_faces(path: str, font_dirs: tuple[str, ...]) -> list[tuple[str, int, bool, str]]:
-    """Named faces in one ``fonts.xml`` or customization file. Face 0 only."""
-    try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, OSError):
-        logger.warning("Could not read Android font config %s", path, exc_info=True)
-        return []
-    faces = []
-    for family in root.iter():
-        if _xml_local(family.tag) != "family":
-            continue
-        hint = (family.get("name") or "").strip()
-        for weight, italic, filename, face in _android_font_children(family):
-            if face != 0:
-                continue
-            resolved = _resolve_android_font(filename, font_dirs)
-            if resolved is None:
-                continue
-            faces.append((hint, weight, italic, resolved))
-    return faces
+def _font_filename_parts(path: str) -> tuple[list[str], list[str]]:
+    """Family chunks, and the style chunks peeled off a font file name.
+
+    A trailing chunk that is only a weight or slant is a style, and so is a
+    style glued on in camel case. A file whose whole name is a style keeps
+    that chunk as the family too.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    chunks = [chunk for chunk in re.split(r"[-_\s]+", stem) if chunk]
+    styles: list[str] = []
+    while len(chunks) > 1 and _chunk_is_only_style(chunks[-1]):
+        styles.append(chunks.pop())
+    if len(chunks) == 1 and _chunk_is_only_style(chunks[0]):
+        styles.append(chunks[0])
+    elif chunks:
+        stripped = _strip_glued_style(chunks[-1])
+        if stripped != chunks[-1]:
+            styles.append(chunks[-1][len(stripped) :])
+    if chunks:
+        chunks[-1] = _strip_glued_style(chunks[-1]) or chunks[-1]
+    return chunks, styles
+
+
+def _family_from_filename(path: str) -> str:
+    """``Roboto-BoldItalic.ttf`` and ``NotoSansCJK-Regular.ttc`` become family names.
+
+    Used when the name table cannot be read. A hyphen chunk that is only a
+    weight or slant is dropped. Condensed and Mono stay, because they are
+    different families.
+    """
+    chunks, _styles = _font_filename_parts(path)
+    words = [word for chunk in chunks for word in (_camel_words(chunk) or [chunk])]
+    return " ".join(words)
+
+
+def _pretty_family(name: str) -> str:
+    parts = [part for part in re.split(r"[-_\s]+", name.strip()) if part]
+    return " ".join(part.capitalize() for part in parts)
+
+
+def _weight_and_italic_from_filename(path: str) -> tuple[int, bool]:
+    _chunks, styles = _font_filename_parts(path)
+    if not styles:
+        return _WEIGHT_ORDER[WEIGHT_REGULAR], False
+    words = [word for chunk in reversed(styles) for word in (_camel_words(chunk) or [chunk])]
+    classified = _classify_style(" ".join(words))
+    if classified is None:
+        return _WEIGHT_ORDER[WEIGHT_REGULAR], False
+    weight, italic, _penalty = classified
+    return _WEIGHT_ORDER[weight], italic
 
 
 def _decode_font_name(raw: bytes, platform: int, encoding: int) -> str:
@@ -875,52 +865,24 @@ def _sfnt_family(path: str) -> str | None:
     return _family_from_name_table(table)
 
 
-def _camel_words(text: str) -> list[str]:
-    return re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+", text)
+def _nearest_weight_name(weight: int) -> str:
+    return min(_WEIGHT_ORDER, key=lambda name: (abs(_WEIGHT_ORDER[name] - weight), _WEIGHT_ORDER[name]))
 
 
-def _chunk_is_only_style(chunk: str) -> bool:
-    return _normalize(chunk) in _STYLE_CHUNK_COMPACT
+def _style_label(weight: int, italic: bool) -> str:
+    name = _nearest_weight_name(weight)
+    if not italic:
+        return name
+    if name == WEIGHT_REGULAR:
+        return "Italic"
+    return f"{name} Italic"
 
 
-def _strip_glued_style(chunk: str) -> str:
-    changed = True
-    while changed and chunk:
-        changed = False
-        for suffix in _CAMEL_STYLE_SUFFIXES:
-            if len(chunk) <= len(suffix) or not chunk.endswith(suffix):
-                continue
-            boundary = chunk[-len(suffix) - 1]
-            if boundary.islower() or boundary.isdigit():
-                chunk = chunk[: -len(suffix)]
-                changed = True
-                break
-    return chunk
+def _is_emoji_family(name: str) -> bool:
+    return "emoji" in name.casefold()
 
 
-def _family_from_filename(path: str) -> str:
-    """``Roboto-BoldItalic.ttf`` and ``NotoSansCJK-Regular.ttc`` become family names.
-
-    Used when the name table cannot be read. A hyphen chunk that is only a
-    weight or slant is dropped. Condensed and Mono stay, because they are
-    different families.
-    """
-    stem = os.path.splitext(os.path.basename(path))[0]
-    chunks = [chunk for chunk in re.split(r"[-_\s]+", stem) if chunk]
-    while len(chunks) > 1 and _chunk_is_only_style(chunks[-1]):
-        chunks.pop()
-    if chunks:
-        chunks[-1] = _strip_glued_style(chunks[-1]) or chunks[-1]
-    words = [word for chunk in chunks for word in (_camel_words(chunk) or [chunk])]
-    return " ".join(words)
-
-
-def _pretty_family(name: str) -> str:
-    parts = [part for part in re.split(r"[-_\s]+", name.strip()) if part]
-    return " ".join(part.capitalize() for part in parts)
-
-
-def _android_family_label(path: str, hint: str, cache: dict[str, str | None]) -> str:
+def _family_label(path: str, hint: str, cache: dict[str, str | None]) -> str:
     if path not in cache:
         cache[path] = _sfnt_family(path)
     found = cache[path]
@@ -929,30 +891,8 @@ def _android_family_label(path: str, hint: str, cache: dict[str, str | None]) ->
     return _family_from_filename(path) or _pretty_family(hint)
 
 
-def _weight_and_italic_from_filename(path: str) -> tuple[int, bool]:
-    stem = os.path.splitext(os.path.basename(path))[0]
-    chunks = [chunk for chunk in re.split(r"[-_\s]+", stem) if chunk]
-    styles = []
-    while len(chunks) > 1 and _chunk_is_only_style(chunks[-1]):
-        styles.append(chunks.pop())
-    if len(chunks) == 1 and _chunk_is_only_style(chunks[0]):
-        styles.append(chunks[0])
-    elif chunks:
-        stripped = _strip_glued_style(chunks[-1])
-        if stripped != chunks[-1]:
-            styles.append(chunks[-1][len(stripped) :])
-    if not styles:
-        return _WEIGHT_ORDER[WEIGHT_REGULAR], False
-    words = [word for chunk in reversed(styles) for word in (_camel_words(chunk) or [chunk])]
-    classified = _classify_style(" ".join(words))
-    if classified is None:
-        return _WEIGHT_ORDER[WEIGHT_REGULAR], False
-    weight, italic, _penalty = classified
-    return _WEIGHT_ORDER[weight], italic
-
-
-def _android_directory_faces(font_dirs: tuple[str, ...]) -> list[tuple[str, int, bool, str]]:
-    """Every font file, when the device has no readable font configuration."""
+def _directory_faces(font_dirs: tuple[str, ...]) -> list[tuple[str, int, bool, str]]:
+    """Every font file under ``font_dirs``. Weight and slant come from the file name."""
     faces = []
     seen = set()
     for directory in font_dirs:
@@ -973,14 +913,14 @@ def _android_directory_faces(font_dirs: tuple[str, ...]) -> list[tuple[str, int,
     return faces
 
 
-def _collapse_android_faces(
+def _collapse_faces(
     faces: list[tuple[str, int, bool, str]],
 ) -> list[tuple[str, int, bool, str]]:
     """One file is one face. A variable font listed at several weights keeps the one nearest Regular."""
     labels: dict[str, str | None] = {}
     best: dict[tuple[str, bool, str], tuple[int, int, tuple[str, int, bool, str]]] = {}
     for order, (hint, weight, italic, path) in enumerate(faces):
-        family = _android_family_label(path, hint, labels)
+        family = _family_label(path, hint, labels)
         if not family or _is_emoji_family(family):
             continue
         key = (_normalize(family), italic, path)
@@ -990,6 +930,100 @@ def _collapse_android_faces(
         if current is None or distance < current[0]:
             best[key] = (distance, order, chosen)
     return [item for _distance, _order, item in sorted(best.values(), key=lambda row: row[1])]
+
+
+def _index_from_faces(faces: list[tuple[str, int, bool, str]]) -> dict[str, tuple[FontFace, ...]]:
+    """Family index for face 0. The same file listed at several weights is kept once."""
+    records = [
+        (family, _style_label(weight, italic), path, 0) for family, weight, italic, path in _collapse_faces(faces)
+    ]
+    return _index_from_records(records, trust_face=True)
+
+
+# Base config, then product and OEM overlays. Later files add families.
+_ANDROID_FONT_CONFIGS = (
+    "/system/etc/fonts.xml",
+    "/product/etc/fonts_customization.xml",
+    "/system_ext/etc/fonts_customization.xml",
+    "/oem/etc/fonts_customization.xml",
+)
+_ANDROID_FONT_DIRS = (
+    "/system/fonts",
+    "/product/fonts",
+    "/system_ext/fonts",
+    "/oem/fonts",
+)
+
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _resolve_android_font(name: str, font_dirs: tuple[str, ...]) -> str | None:
+    """A config's font filename, under one of the system font directories."""
+    name = name.strip().strip("\x00")
+    if not name or "emoji" in os.path.basename(name).casefold():
+        return None
+    if os.path.isabs(name):
+        return name if _is_font_file(name) else None
+    if os.path.basename(name) != name:
+        return None
+    for directory in font_dirs:
+        path = os.path.join(directory, name)
+        if _is_font_file(path):
+            return path
+    return None
+
+
+def _elements_named(family: ET.Element, tag: str) -> list[ET.Element]:
+    """``tag`` elements inside one family. Legacy files sit under ``<fileset>``."""
+    return [child for child in family.iter() if child is not family and _xml_local(child.tag) == tag]
+
+
+def _android_font_children(family: ET.Element) -> list[tuple[int, bool, str, int]]:
+    """``(weight, italic, filename, face)`` from ``<font>`` or legacy ``<file>`` children."""
+    fonts = _elements_named(family, "font")
+    if fonts:
+        rows = []
+        for font in fonts:
+            filename = (font.text or "").strip()
+            try:
+                face = int(font.get("index") or "0")
+            except ValueError:
+                continue
+            try:
+                weight = int(font.get("weight") or "400")
+            except ValueError:
+                weight = 400
+            style = (font.get("style") or "normal").strip().casefold()
+            rows.append((weight, style in _ITALIC_WORDS, filename, face))
+        return rows
+    # Pre-Lollipop system_fonts.xml lists regular, bold, italic, bold italic.
+    files = _elements_named(family, "file")
+    legacy = ((400, False), (700, False), (400, True), (700, True))
+    return [(weight, italic, (child.text or "").strip(), 0) for child, (weight, italic) in zip(files, legacy)]
+
+
+def _android_config_faces(path: str, font_dirs: tuple[str, ...]) -> list[tuple[str, int, bool, str]]:
+    """Named faces in one ``fonts.xml`` or customization file. Face 0 only."""
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        logger.warning("Could not read Android font config %s", path, exc_info=True)
+        return []
+    faces = []
+    for family in root.iter():
+        if _xml_local(family.tag) != "family":
+            continue
+        hint = (family.get("name") or "").strip()
+        for weight, italic, filename, face in _android_font_children(family):
+            if face != 0:
+                continue
+            resolved = _resolve_android_font(filename, font_dirs)
+            if resolved is None:
+                continue
+            faces.append((hint, weight, italic, resolved))
+    return faces
 
 
 def _android_font_index(
@@ -1011,12 +1045,8 @@ def _android_font_index(
             if os.path.isfile(config):
                 faces.extend(_android_config_faces(config, chosen_dirs))
         if not faces:
-            faces.extend(_android_directory_faces(chosen_dirs))
-        records = [
-            (family, _android_style(weight, italic), path, 0)
-            for family, weight, italic, path in _collapse_android_faces(faces)
-        ]
-        index = _index_from_records(records, trust_face=True)
+            faces.extend(_directory_faces(chosen_dirs))
+        index = _index_from_faces(faces)
     except (OSError, ValueError):
         logger.warning("Android font scan failed", exc_info=True)
         return {}
@@ -1047,17 +1077,16 @@ def _ios_font_index(font_dirs: tuple[str, ...] | None = None) -> dict[str, tuple
         return index
     chosen_dirs = _IOS_FONT_DIRS if font_dirs is None else font_dirs
     try:
-        records = [
-            (family, _android_style(weight, italic), path, 0)
-            for family, weight, italic, path in _collapse_android_faces(_android_directory_faces(chosen_dirs))
-        ]
-        index = _index_from_records(records, trust_face=True)
+        index = _index_from_faces(_directory_faces(chosen_dirs))
     except (OSError, ValueError):
         logger.warning("iOS font directory scan failed", exc_info=True)
         return {}
     if not index:
         logger.warning("No iOS system fonts found; the font list will only offer %s", ARIALUNI)
     return index
+
+
+# One scan for the process, then the Kivy name of each theme role.
 
 
 def _load_font_index() -> dict | None:
@@ -1096,10 +1125,6 @@ def available_families() -> list[str]:
     """Family names a theme can use, with the bundled alias first."""
     names = {name for name in font_index() if _normalize(name) != _normalize(ARIALUNI)}
     return [ARIALUNI, *sorted(names, key=str.casefold)]
-
-
-def _is_font_path(value: str) -> bool:
-    return "/" in value or "\\" in value or value.lower().endswith(FONT_EXTENSIONS)
 
 
 def _coerce_faces(value) -> tuple[FontFace, ...]:
@@ -1162,10 +1187,6 @@ def available_styles(family: str, weight: str, index=None) -> list[str]:
 
 def _is_registered(name: str) -> bool:
     return name in getattr(LabelBase, "_fonts", {})
-
-
-def _is_font_file(path: str) -> bool:
-    return os.path.isfile(path) and path.lower().endswith(FONT_EXTENSIONS)
 
 
 def _alias_name(family: str, weight: str, style: str) -> str:
