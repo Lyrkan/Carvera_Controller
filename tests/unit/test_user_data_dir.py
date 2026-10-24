@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import pytest
@@ -52,6 +53,41 @@ def test_migrate_moves_allowlisted_files_and_meshes(tmp_path):
     assert (legacy / "icon" / "icon.png").is_file()
     assert (legacy / "mods" / "style.kv").is_file()
     assert (legacy / "other.json").is_file()
+
+
+def test_migrate_summarizes_files_left_in_place(tmp_path, caplog):
+    legacy = _legacy_tree(tmp_path)
+    dest = tmp_path / "makera"
+    (dest / "beds" / "meshes").mkdir(parents=True)
+    (dest / "beds.json").write_text('{"version": 2}', encoding="utf-8")
+    (dest / "facing-wizard-presets.json").write_text("{}", encoding="utf-8")
+    (dest / "beds" / "meshes" / "plate.obj").write_text("kept\n", encoding="utf-8")
+
+    with caplog.at_level(logging.DEBUG, logger="carveracontroller.addons.probing.operations.ConfigUtils"):
+        migrate_legacy_user_files(str(dest), str(legacy))
+
+    info = [record.message for record in caplog.records if record.levelno == logging.INFO]
+    assert info == [f"Left 3 legacy files in place under {legacy}; destinations in {dest} already exist"]
+    debug = [record.message for record in caplog.records if record.levelno == logging.DEBUG]
+    assert len(debug) == 1
+    assert str(legacy / "beds.json") in debug[0]
+    assert str(legacy / "facing-wizard-presets.json") in debug[0]
+    assert str(legacy / "beds" / "meshes" / "plate.obj") in debug[0]
+
+
+def test_migrate_left_in_place_summary_is_singular_for_one_file(tmp_path, caplog):
+    legacy = tmp_path / "kivy"
+    dest = tmp_path / "makera"
+    legacy.mkdir()
+    dest.mkdir()
+    (legacy / "beds.json").write_text("{}", encoding="utf-8")
+    (dest / "beds.json").write_text('{"version": 2}', encoding="utf-8")
+
+    with caplog.at_level(logging.INFO, logger="carveracontroller.addons.probing.operations.ConfigUtils"):
+        migrate_legacy_user_files(str(dest), str(legacy))
+
+    info = [record.message for record in caplog.records if record.levelno == logging.INFO]
+    assert info == [f"Left 1 legacy file in place under {legacy}; destinations in {dest} already exist"]
 
 
 def test_migrate_does_not_overwrite_existing_destination(tmp_path):
@@ -136,6 +172,7 @@ def test_config_dir_migrates_from_user_data_dir(monkeypatch, tmp_path):
         user_data_dir = str(dest)
 
     monkeypatch.setattr(ConfigUtils, "CONFIG_DIR", None)
+    monkeypatch.setattr(ConfigUtils, "_migrated_pairs", set())
     monkeypatch.delenv(USER_DATA_DIR_ENV, raising=False)
     monkeypatch.setattr(
         "carveracontroller.addons.probing.operations.ConfigUtils.LEGACY_CONFIG_DIR",
@@ -148,6 +185,47 @@ def test_config_dir_migrates_from_user_data_dir(monkeypatch, tmp_path):
     assert not (legacy / "beds.json").exists()
     assert (legacy / "config.ini").is_file()
     assert ConfigUtils.load_config("beds.json") == {"version": 1}
+
+
+def test_config_dir_scans_legacy_files_once_per_directory(monkeypatch, tmp_path):
+    legacy = _legacy_tree(tmp_path)
+    dest = tmp_path / "makera"
+
+    class _App:
+        user_data_dir = str(dest)
+
+    monkeypatch.setattr(ConfigUtils, "CONFIG_DIR", None)
+    monkeypatch.setattr(ConfigUtils, "_migrated_pairs", set())
+    monkeypatch.delenv(USER_DATA_DIR_ENV, raising=False)
+    monkeypatch.setattr(
+        "carveracontroller.addons.probing.operations.ConfigUtils.LEGACY_CONFIG_DIR",
+        str(legacy),
+    )
+    monkeypatch.setattr("kivy.app.App.get_running_app", lambda: _App())
+
+    assert ConfigUtils.config_dir() == str(dest)
+    assert not (legacy / "beds.json").exists()
+
+    (dest / "facing-wizard-presets.json").unlink()
+    (legacy / "facing-wizard-presets.json").write_text('{"presets": ["later"]}', encoding="utf-8")
+
+    assert ConfigUtils.config_dir() == str(dest)
+    assert (legacy / "facing-wizard-presets.json").is_file()
+    assert not (dest / "facing-wizard-presets.json").exists()
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second_legacy = _legacy_tree(second_root)
+    second_dest = tmp_path / "other"
+    monkeypatch.setattr(
+        "carveracontroller.addons.probing.operations.ConfigUtils.LEGACY_CONFIG_DIR",
+        str(second_legacy),
+    )
+    _App.user_data_dir = str(second_dest)
+
+    assert ConfigUtils.config_dir() == str(second_dest)
+    assert (second_dest / "beds.json").is_file()
+    assert not (second_legacy / "beds.json").exists()
 
 
 def test_config_dir_without_app_raises(monkeypatch):

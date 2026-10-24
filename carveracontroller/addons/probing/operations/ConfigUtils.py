@@ -32,6 +32,8 @@ class ConfigUtils:
     # Allows tests to override the config directory during testing.
     # Production leaves this unset and uses app.user_data_dir.
     CONFIG_DIR: str | None = None
+    # (legacy dir, user-data dir) pairs already scanned.
+    _migrated_pairs: set[tuple[str, str]] = set()
 
     @staticmethod
     def config_dir() -> str:
@@ -45,7 +47,10 @@ class ConfigUtils:
         if app is None:
             raise RuntimeError("user data directory is unavailable")
         dest = app.user_data_dir
-        migrate_legacy_user_files(dest, LEGACY_CONFIG_DIR)
+        pair = (os.path.normpath(LEGACY_CONFIG_DIR), os.path.normpath(dest))
+        if pair not in ConfigUtils._migrated_pairs:
+            migrate_legacy_user_files(dest, LEGACY_CONFIG_DIR)
+            ConfigUtils._migrated_pairs.add(pair)
         return dest
 
     @staticmethod
@@ -89,8 +94,9 @@ def migrate_legacy_user_files(dest_dir: str, source_dir: str | None = None) -> N
         logger.error(f"Could not prepare user data migration from {source} to {dest_dir}: {exc}")
         return
 
+    left_in_place: list[str] = []
     for name in LEGACY_FILES:
-        _move_if_absent(os.path.join(source, name), os.path.join(dest_dir, name))
+        _move_if_absent(os.path.join(source, name), os.path.join(dest_dir, name), left_in_place)
 
     mesh_source = os.path.join(source, LEGACY_MESH_DIR)
     mesh_dest = os.path.join(dest_dir, LEGACY_MESH_DIR)
@@ -103,17 +109,25 @@ def migrate_legacy_user_files(dest_dir: str, source_dir: str | None = None) -> N
         for name in names:
             src = os.path.join(mesh_source, name)
             if os.path.isfile(src):
-                _move_if_absent(src, os.path.join(mesh_dest, name))
+                _move_if_absent(src, os.path.join(mesh_dest, name), left_in_place)
         _remove_dir_if_empty(mesh_source)
         _remove_dir_if_empty(os.path.join(source, LEGACY_BEDS_DIR))
 
+    if left_in_place:
+        label = "file" if len(left_in_place) == 1 else "files"
+        logger.info(
+            f"Left {len(left_in_place)} legacy {label} in place under {source}; "
+            f"destinations in {dest_dir} already exist"
+        )
+        logger.debug(f"Legacy files left in place: {', '.join(left_in_place)}")
 
-def _move_if_absent(src: str, dest: str) -> None:
+
+def _move_if_absent(src: str, dest: str, left_in_place: list[str]) -> None:
     try:
         if not os.path.isfile(src):
             return
         if os.path.exists(dest):
-            logger.info(f"Leaving {src} in place; {dest} already exists")
+            left_in_place.append(src)
             return
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.move(src, dest)
