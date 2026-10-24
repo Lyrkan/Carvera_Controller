@@ -1,6 +1,7 @@
 [unreleased]
 - Fixed: Android builds were incorrectly detecting the default language
 - Enhancement: Every file playback will start by going the configured clearance_z
+- Change: Store probing presets, facing presets, bed settings, calibration settings, and custom bed meshes in the app user-data directory, and move existing copies out of ~/.kivy on first launch
 
 [2.3.0-RC1]
 - Enhancement: Upload and download multiple selected files from the file browser, with one progress popup for the batch
