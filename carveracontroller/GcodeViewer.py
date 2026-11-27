@@ -23,6 +23,7 @@ from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 from carveracontroller.translation import tr
+from carveracontroller.ui.file_sim_info.summary import FileSimSummary, summarize_file_sim
 
 from .CNC import LASER_TOOL_NUMBER, ZPROBE_TOOL_NUMBER, is_probe_tools_range
 
@@ -52,9 +53,12 @@ from kivy.input.motionevent import MotionEvent
 # input
 from kivy.input.provider import MotionEventProvider
 
+from carveracontroller.ui.theme import get_theme, watch_theme
+
 from .addons.beds.materials import normalize_bed_material, style_for_bed_material
 from .addons.beds.mesh_loader import BED_VERTEX_FORMAT, BedMeshData, load_bed_mesh, pack_bed_mesh_chunks
 from .addons.beds.placement import model_offset_viewer, wcs_rotation_4x4
+from .addons.stock.mrr_smoothing import MRR_SMOOTH_WINDOW_SEC
 from .addons.stock.simulator import (
     DEFAULT_MESH_THROTTLE_S,
     PLAY_MESH_THROTTLE_S,
@@ -241,26 +245,22 @@ def vec3_distance(v1, v2):
 
 GRID_STEP_MM = 10.0
 GRID_MAJOR_STEP_MM = 100.0
-GRID_COLOR_MINOR = [0.35, 0.35, 0.35]
-GRID_COLOR_MAJOR = [0.55, 0.55, 0.55]
-# axis.obj points along +Y; rotations map meshes to world axes (see axis arrow setup)
-AXIS_COLOR_X = [1.0, 0.0, 0.0]
-AXIS_COLOR_Y = [0.0, 1.0, 0.0]
-AXIS_COLOR_Z = [0.0, 0.0, 1.0]
+# Ten tool colors (toolpath.glsl tool_color0..9).
+TOOL_PALETTE_SIZE = 10
 
-# T1–T10 tool colors (matches toolpath.glsl tool_palette_color).
-TOOL_PALETTE = (
-    (0.406684, 0.735902, 0.235489, 1),
-    (0.000000, 0.459774, 0.840728, 1),
-    (0.779915, 0.319537, 0.130857, 1),
-    (0.740127, 0.236840, 0.700182, 1),
-    (0.000000, 0.755849, 0.602221, 1),
-    (0.825216, 0.043248, 0.043248, 1),
-    (0.894806, 0.717161, 0.000000, 1),
-    (0.128923, 0.578319, 0.877916, 1),
-    (0.431518, 0.268501, 0.839063, 1),
-    (0.248716, 0.777237, 0.402157, 1),
-)
+
+def _theme_tool_palette_entry(theme, index: int) -> tuple[float, float, float, float]:
+    return tuple(getattr(theme, f"viewer_tool_color_{index + 1}"))
+
+
+def _theme_speed_colormap_stops(theme) -> tuple[tuple[float, float, float], ...]:
+    return (
+        tuple(theme.speed_colormap_1[:3]),
+        tuple(theme.speed_colormap_2[:3]),
+        tuple(theme.speed_colormap_3[:3]),
+        tuple(theme.speed_colormap_4[:3]),
+    )
+
 
 DEFAULT_FEED_MM_MIN = 3000.0
 DEFAULT_AXIS_LIMITS = {
@@ -326,30 +326,37 @@ def _linedata_tool(line):
 
 
 def bridge_toolpath_vertices(lines, prev_line=None):
-    """Insert extra vertices so discrete line-strip attributes do not interpolate."""
+    """Insert extra vertices so discrete line-strip attributes do not interpolate.
+
+    A parsed row looks like:
+        [x, y, z, a, move_type, line_number, tool, feed, speed]
+    where move_type is 0 for a rapid move and 1 for a cutting move.
+
+    The graphics card blends colours (and other attributes) along each line, so a rapid
+    followed by a cut would fade from red to green. To avoid that, when the move type or
+    the tool changes we insert a copy of the previous point that already has the new move's
+    values. The zero-length step between the two points takes the switch, and the real move
+    after it keeps one flat colour.
+    """
     dataarrs = []
     last_line = prev_line
-    last_color = prev_line[4] if prev_line is not None else -1
     for line in lines:
-        color = line[4]
-        tool = _linedata_tool(line)
-        last_tool = _linedata_tool(last_line)
+        if last_line is not None:
+            tool = _linedata_tool(line)
+            last_tool = _linedata_tool(last_line)
+            tool_changed = tool is not None and last_tool is not None and tool != last_tool
+            type_changed = last_line[4] >= 0 and line[4] >= 0 and line[4] != last_line[4]
+            if tool_changed or type_changed:
+                snap = last_line.copy()
+                if tool_changed:
+                    snap[6] = tool
+                if type_changed:
+                    snap[4] = line[4]
+                    snap[7:] = line[7:]  # feed and spindle speed belong to the new move
+                dataarrs.append(snap)
 
-        if last_line is not None and tool is not None and last_tool is not None and tool != last_tool:
-            snap = last_line.copy()
-            snap[6] = tool
-            dataarrs.append(snap)
-
-        if last_color >= 0 and color >= 0 and color != last_color:
-            copyline = line.copy()
-            copyline[4] = last_color
-            dataarrs.append(copyline)
-            dataarrs.append(line)
-        else:
-            dataarrs.append(line)
-
+        dataarrs.append(line)
         last_line = line
-        last_color = color
     return dataarrs
 
 
@@ -402,9 +409,10 @@ def _feed_z_height_range_mm(
 
 
 def tool_palette_rgb(tool_number):
-    """RGB from tool number, wrapping through TOOL_PALETTE (matches toolpath.glsl)."""
-    idx = (int(tool_number) - 1) % len(TOOL_PALETTE)
-    return TOOL_PALETTE[idx][:3]
+    """RGB for a tool number, wrapping through the theme tool colors."""
+    theme = get_theme()
+    idx = (int(tool_number) - 1) % TOOL_PALETTE_SIZE
+    return list(_theme_tool_palette_entry(theme, idx)[:3])
 
 
 def tool_marker_palette_rgb(tool_number):
@@ -414,20 +422,28 @@ def tool_marker_palette_rgb(tool_number):
     return (r * (1 - t) + t, g * (1 - t) + t, b * (1 - t) + t)
 
 
+def toolpath_color_uniforms(theme) -> dict:
+    """RGB uniforms for toolpath.glsl, same colors as the legend."""
+    values = {
+        f"tool_color{index}": list(_theme_tool_palette_entry(theme, index)[:3]) for index in range(TOOL_PALETTE_SIZE)
+    }
+    for index, rgb in enumerate(_theme_speed_colormap_stops(theme)):
+        values[f"speed_color{index}"] = list(rgb)
+    return values
+
+
 def speed_colormap_rgb(t):
     """Match toolpath.glsl speed_colormap."""
+    c1, c2, c3, c4 = _theme_speed_colormap_stops(get_theme())
     t = max(0.0, min(1.0, float(t)))
     if t < 0.33:
-        a = (0.2, 0.4, 0.9)
-        b = (0.1, 0.7, 0.5)
+        a, b = c1, c2
         u = t / 0.33
     elif t < 0.66:
-        a = (0.1, 0.7, 0.5)
-        b = (0.95, 0.85, 0.15)
+        a, b = c2, c3
         u = (t - 0.33) / 0.33
     else:
-        a = (0.95, 0.85, 0.15)
-        b = (0.9, 0.25, 0.2)
+        a, b = c3, c4
         u = (t - 0.66) / 0.34
     return (a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u)
 
@@ -440,7 +456,7 @@ PATH_GHOST_RECENT_ALPHA = 1.0
 PATH_GHOST_RECENT_PART_FRACTION = 3.0
 VIEW_CUBE_SIZE = dp(96)
 VIEW_CUBE_MARGIN = dp(10)
-VIEW_CUBE_TOOLBAR_INSET = dp(48)
+VIEW_CUBE_TOOLBAR_INSET = dp(52)
 VIEW_CUBE_TEXTURE_UNIT = 1
 VIEW_CUBE_WORLD_SCALE = 0.5
 LASER_DECAL_TEXTURE_UNIT = 1
@@ -453,6 +469,7 @@ def _gcode_viewer_asset(name):
 
 VIEW_CUBE_ATLAS_PATH = _gcode_viewer_asset("view_cube_atlas.png")
 VIEW_CUBE_MODEL_PATH = _gcode_viewer_asset("view_cube_model.obj")
+# axis.obj points along +Y; rotations map meshes to world axes.
 AXIS_OBJ_PATH = _gcode_viewer_asset("axis.obj")
 
 
@@ -682,6 +699,13 @@ def frame_call_back_test(distance, num):
     print(f"Current line: {num}")
 
 
+# What a running cut simulation draws. Switching these does not reset the carve.
+SIM_VIEW_PATHS = "paths"
+SIM_VIEW_STOCK = "stock"
+SIM_VIEW_SIMULATION = "simulation"
+SIM_VIEWS = (SIM_VIEW_PATHS, SIM_VIEW_STOCK, SIM_VIEW_SIMULATION)
+
+
 class GCodeViewer(Widget):
     axis = (0, 0, 1)
     angle = 0
@@ -716,7 +740,7 @@ class GCodeViewer(Widget):
     sim_hud_text = StringProperty("")
     sim_hud_visible = BooleanProperty(False)
     sim_carving = BooleanProperty(False)
-    sim_mesh_visible = BooleanProperty(True)
+    sim_view = StringProperty(SIM_VIEW_SIMULATION)
     stock_visible = BooleanProperty(False)
     bed_visible = BooleanProperty(False)
 
@@ -908,7 +932,7 @@ class GCodeViewer(Widget):
         self.stock_visible = False
         self.simulate_cut = False
         self.stock_mesh_while_playing = True
-        self.sim_mesh_visible = True
+        self.sim_view = SIM_VIEW_SIMULATION
         # Keep the translucent AABB up after pause until the worker flush
         # patches GPU chunks; otherwise the last meshed shell (often uncut)
         # is shown for a frame.
@@ -937,6 +961,38 @@ class GCodeViewer(Widget):
         self._apply_default_stock_settings()
 
         Clock.schedule_interval(self._on_frame_tick, 1 / 60)
+
+        self._stop_theme = watch_theme(self._on_theme_changed)
+
+    def _on_theme_changed(self, theme) -> None:
+        self._update_grid_uniforms()
+        self._update_toolpath_color_uniforms(theme)
+        self._refresh_tool_colors()
+        if self.stock_bounds_mm is not None:
+            self._rebuild_stock_mesh()
+        self._update_carved_uniforms()
+        self._scene_dirty = True
+
+    def _refresh_tool_colors(self) -> None:
+        """Rebuild tool meshes so flute and shank pick up the current theme."""
+        if not self._tool_meshes and self._default_tool_mesh is None:
+            return
+        scale = getattr(self, "move_scale_by_positon", None)
+        if not scale:
+            return
+        self._tool_meshes, self._default_tool_mesh = build_tool_meshes(
+            self.tool_table or {}, scale=scale * self.tool_unit_scale
+        )
+        if not self.pointer_mesh_instrs:
+            return
+        vertices, indices, _fmt = self._get_tool_mesh(self._active_tool_number)
+        for mesh in self.pointer_mesh_instrs:
+            mesh.vertices = vertices
+            mesh.indices = indices
+
+    def _update_toolpath_color_uniforms(self, theme) -> None:
+        for name, rgb in toolpath_color_uniforms(theme).items():
+            self.linemesh[name] = rgb
 
     def _on_size_change(self, *args):
         self._proj_dirty = True
@@ -1089,8 +1145,9 @@ class GCodeViewer(Widget):
         self.canvas.add(self.gridmesh)
         if self.bed_visible:
             self.canvas.add(self.bedmesh)
-        if self.stock_visible or self.simulate_cut:
+        if self._stock_shell_on_canvas():
             self.canvas.add(self.stockmesh)
+        if self._carved_stock_visible():
             self.canvas.add(self.carvedmesh)
         self.canvas.add(self.linemesh)
         self.canvas.add(self.pointermesh)
@@ -1118,10 +1175,14 @@ class GCodeViewer(Widget):
         self.gridmesh["grid_size"] = float(self._grid_quad_extent())
         self.gridmesh["subcell_size"] = float(GRID_STEP_MM * scale)
         self.gridmesh["cell_size"] = float(GRID_MAJOR_STEP_MM * scale)
-        self.gridmesh["color_minor"] = GRID_COLOR_MINOR
-        self.gridmesh["color_major"] = GRID_COLOR_MAJOR
-        self.gridmesh["color_axis_x"] = AXIS_COLOR_X
-        self.gridmesh["color_axis_y"] = AXIS_COLOR_Y
+        theme = get_theme()
+        self.gridmesh["color_minor"] = list(theme.viewer_grid_minor[:3])
+        self.gridmesh["color_major"] = list(theme.viewer_grid_major[:3])
+        self.gridmesh["color_axis_x"] = list(theme.viewer_axis_x[:3])
+        self.gridmesh["color_axis_y"] = list(theme.viewer_axis_y[:3])
+        self.axisxmesh["diff_color"] = list(theme.viewer_axis_y[:3])
+        self.axisymesh["diff_color"] = list(theme.viewer_axis_z[:3])
+        self.axiszmesh["diff_color"] = list(theme.viewer_axis_x[:3])
 
     def clearDisplay(self, close_progress=True):
         self.lengths = []
@@ -1167,7 +1228,7 @@ class GCodeViewer(Widget):
         self.sim_hud_text = ""
         self.sim_hud_visible = False
         self.sim_carving = False
-        self.sim_mesh_visible = True
+        self.sim_view = SIM_VIEW_SIMULATION
         self.stock_visible = False
         self.bed_visible = False
         self.simulate_cut = False
@@ -1525,6 +1586,18 @@ class GCodeViewer(Widget):
         if self.frame_callback is not None:
             cur_distance, linenumber = self.get_cur_pos_index()
             self.frame_callback(cur_distance, linenumber)
+
+    def seek_to_vertex(self, vertex: float) -> bool:
+        """Move the playhead to a (fractional) vertex index of the toolpath."""
+        if not self.lengths:
+            return False
+        last = len(self.lengths) - 1
+        position = min(max(float(vertex), 0.0), float(last))
+        index = int(position)
+        following = min(index + 1, last)
+        distance = self.lengths[index] + (position - index) * (self.lengths[following] - self.lengths[index])
+        self.set_pos_by_distance(min(distance, self.get_total_distance()))
+        return True
 
     def _report_time_estimate_progress(self, state, percent):
         """Call the progress callback on the main thread (call from worker via Clock.schedule_once)."""
@@ -2058,7 +2131,7 @@ class GCodeViewer(Widget):
         self.stock_visible = stock_visible
         self.simulate_cut = want_sim
         if not want_sim:
-            self.sim_mesh_visible = True
+            self.sim_view = SIM_VIEW_SIMULATION
             self._cancel_sim_carving_hold()
             self.sim_carving = False
         self.stock_mesh_while_playing = mesh_while
@@ -2162,20 +2235,35 @@ class GCodeViewer(Widget):
 
         Clock.schedule_once(_apply, 0)
 
-    def set_sim_mesh_visible(self, visible: bool) -> None:
-        """Show or hide the carved stock without resetting occupancy.
+    def set_sim_view(self, mode: str) -> None:
+        """Choose what a running simulation draws without resetting the carve.
 
-        Hiding leaves the same preview shell used when stock is shown and
-        simulation is off. Showing rebuilds that shell as edge lines over the
-        carved mesh.
+        ``paths`` hides the stock shell and the carved mesh. ``stock`` shows
+        the uncut preview shell. ``simulation`` shows the carved mesh when it
+        is allowed to draw, and the preview shell otherwise.
         """
-        visible = bool(visible)
-        if visible == bool(getattr(self, "sim_mesh_visible", True)):
+        mode = str(mode or "")
+        if mode not in SIM_VIEWS:
+            logger.warning("ignored unknown simulation view %r", mode)
             return
-        self.sim_mesh_visible = visible
+        if mode == self._sim_view_mode():
+            return
+        self.sim_view = mode
         self._rebuild_stock_mesh()
         self._ensure_stock_on_canvas()
         self._scene_dirty = True
+
+    def _sim_view_mode(self) -> str:
+        mode = getattr(self, "sim_view", SIM_VIEW_SIMULATION)
+        if mode not in SIM_VIEWS:
+            return SIM_VIEW_SIMULATION
+        return str(mode)
+
+    def _stock_shell_on_canvas(self) -> bool:
+        """True when the preview shell (fill and/or edges) should be drawn."""
+        if not (self.stock_visible or self.simulate_cut):
+            return False
+        return not (self.simulate_cut and self._sim_view_mode() == SIM_VIEW_PATHS)
 
     def _vertex_to_path_percent(self, vertex: int) -> float:
         total = self.get_total_distance() if self.lengths else 0.0
@@ -2187,24 +2275,29 @@ class GCodeViewer(Widget):
     def _ensure_stock_on_canvas(self) -> None:
         if not self._viewer_meshes_active:
             return
-        show_stock = self.stock_visible or self.simulate_cut
+        show_shell = self._stock_shell_on_canvas()
         show_voxels = self._carved_stock_visible()
         for mesh in (self.stockmesh, self.carvedmesh):
             if mesh in self.canvas.children:
                 self.canvas.remove(mesh)
-        if not show_stock:
-            self._clear_carved_meshes()
+        if not show_shell and not show_voxels:
+            # Paths-only keeps the carve buffers so switching back does not restart.
+            if not self.simulate_cut:
+                self._clear_carved_meshes()
             return
         try:
             if getattr(self, "bedmesh", None) is not None and self.bedmesh in self.canvas.children:
                 idx = self.canvas.children.index(self.bedmesh) + 1
             else:
                 idx = self.canvas.children.index(self.gridmesh) + 1
-            self.canvas.insert(idx, self.stockmesh)
+            if show_shell:
+                self.canvas.insert(idx, self.stockmesh)
+                idx += 1
             if show_voxels:
-                self.canvas.insert(idx + 1, self.carvedmesh)
+                self.canvas.insert(idx, self.carvedmesh)
         except ValueError:
-            self.canvas.add(self.stockmesh)
+            if show_shell:
+                self.canvas.add(self.stockmesh)
             if show_voxels:
                 self.canvas.add(self.carvedmesh)
         self._raise_view_cube_to_top()
@@ -2366,7 +2459,7 @@ class GCodeViewer(Widget):
         pause, ``_defer_carved_stock`` keeps that AABB until the flush
         patches GPU chunks so the stale uncut shell is not flashed.
         """
-        if not bool(getattr(self, "sim_mesh_visible", True)):
+        if self._sim_view_mode() != SIM_VIEW_SIMULATION:
             return False
         if self._defer_carved_stock:
             return False
@@ -2758,6 +2851,61 @@ class GCodeViewer(Widget):
             has_4axis=has_4axis,
             has_off_axis_y=has_off_axis_y,
             speeds=self.raw_spindle_speeds,
+            feeds=self.raw_feed_rates,
+            axis_limits=_axis_limits_from_app(),
+        )
+
+    def get_sim_mrr_at_playhead(self) -> float | None:
+        if not self.simulate_cut:
+            return None
+        sim = self._stock_simulator
+        if sim is None or not sim.enabled:
+            return None
+        return sim.mrr_at(float(self.cur_line_index or 0.0), window_sec=MRR_SMOOTH_WINDOW_SEC)
+
+    def sim_summary_key(self) -> tuple:
+        """Cheap key that changes whenever ``sim_file_summary()`` could return something new."""
+        app = App.get_running_app()
+        remote = getattr(app, "selected_remote_filename", "") if app is not None else ""
+        local = getattr(app, "selected_local_filename", "") if app is not None else ""
+        sim = self._stock_simulator
+        mrr_version = None
+        if self.simulate_cut and sim is not None and sim.enabled:
+            mrr_version = sim.mrr_version
+        return (
+            mrr_version,
+            id(self.raw_positions),
+            len(self.raw_positions),
+            id(self.vertex_types),
+            len(self.line_times or ()),
+            remote,
+            local,
+        )
+
+    def sim_file_summary(self) -> FileSimSummary:
+        app = App.get_running_app()
+        remote = ""
+        local = ""
+        if app is not None:
+            remote = getattr(app, "selected_remote_filename", "") or ""
+            local = getattr(app, "selected_local_filename", "") or ""
+        mrr = None
+        sim = self._stock_simulator
+        if self.simulate_cut and sim is not None and sim.enabled:
+            mrr = sim.mrr_copy()
+        return summarize_file_sim(
+            filename=_display_filename(remote or local),
+            positions=self.raw_positions,
+            mrr=mrr,
+            line_times=self.line_times or None,
+            feeds=self.raw_feed_rates,
+            angles=self.angles_of_vertices,
+            axis_limits=_axis_limits_from_app(),
+            vertex_types=self.vertex_types,
+            tools=self.raw_tools,
+            tool_table=self.tool_table,
+            tool_unit_scale=float(self.tool_unit_scale or 1.0),
+            laser_tool_number=LASER_TOOL_NUMBER,
         )
 
     def _sync_stock_simulation(self, current_vertex: float) -> None:
@@ -2881,15 +3029,12 @@ class GCodeViewer(Widget):
         axis_offset = (-self.lines_center[0], -self.lines_center[1], -self.lines_center[2])
         self.axisxmesh["offset"] = axis_offset
         self.axisxmesh["rotation"] = self._identity_mat
-        self.axisxmesh["diff_color"] = AXIS_COLOR_Y
 
         self.axisymesh["offset"] = axis_offset
         self.axisymesh["rotation"] = self._axis_y_rot
-        self.axisymesh["diff_color"] = AXIS_COLOR_Z
 
         self.axiszmesh["offset"] = axis_offset
         self.axiszmesh["rotation"] = self._axis_z_rot
-        self.axiszmesh["diff_color"] = AXIS_COLOR_X
 
         self.axisxmesh["modelview_mat"] = self.m_viewMatrix
         self.axisymesh["modelview_mat"] = self.m_viewMatrix
@@ -3148,6 +3293,13 @@ def _z_bucket_index(z_mm, z_min_mm, z_max_mm):
     z_t = _clamp01((float(z_mm) - float(z_min_mm)) / z_span)
     bucket = int(math.floor((1.0 - z_t) * 10.0 + 0.5))
     return min(max(bucket, 0), VISIBILITY_BUCKET_COUNT - 1)
+
+
+def _display_filename(path: str) -> str:
+    text = (path or "").replace("\\", "/").rstrip("/")
+    if not text:
+        return ""
+    return text.rsplit("/", 1)[-1]
 
 
 def _axis_limits_from_settings(setting_list):

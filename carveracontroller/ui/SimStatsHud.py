@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from kivy.animation import Animation
+from kivy.app import App
 from kivy.graphics import Color, Line, PopMatrix, PushMatrix, Rectangle, Rotate, Translate
 from kivy.metrics import dp
 from kivy.properties import BooleanProperty, ListProperty, NumericProperty, StringProperty
@@ -10,11 +11,12 @@ from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.widget import Widget
 
-from carveracontroller.addons.tooltips.Tooltips import ToolTipButton
+from carveracontroller.addons.tooltips.Tooltips import ToolTipButton, ToolTipDropDown
+from carveracontroller.GcodeViewer import SIM_VIEW_PATHS, SIM_VIEW_SIMULATION, SIM_VIEW_STOCK
+from carveracontroller.translation import tr
+from carveracontroller.ui.theme import DARK, get_theme, watch_theme
 
 EYE_ICON_SOURCE = "data/eye.png"
-ICON_VISIBLE_RGBA = (0.93, 0.93, 0.93, 1.0)
-ICON_HIDDEN_RGBA = (0.42, 0.42, 0.42, 0.9)
 
 
 class _HudIconToolTip(ToolTipButton):
@@ -54,11 +56,13 @@ class SimStatsHudIcon(ButtonBehavior, Widget):
         with self.canvas:
             PushMatrix()
             self._translate = Translate(0, 0)
-            self._color = Color(*ICON_VISIBLE_RGBA)
+            theme = get_theme()
+            self._color = Color(*theme.icon)
             self._icon = Rectangle(source=self.icon_source, size=(icon, icon))
             PopMatrix()
         self._tip = _HudIconToolTip()
         self.add_widget(self._tip)
+        self._stop_theme = watch_theme(self._apply_theme)
         self.bind(
             pos=self._layout,
             size=self._layout,
@@ -80,8 +84,18 @@ class SimStatsHudIcon(ButtonBehavior, Widget):
         self._tip.pos = self.pos
         self._tip.size = self.size
 
-    def _sync_icon(self, *_args) -> None:
-        self._color.rgba = ICON_VISIBLE_RGBA if self.icon_active else ICON_HIDDEN_RGBA
+    def _apply_theme(self, theme) -> None:
+        self._sync_icon(theme=theme)
+
+    def _sync_icon(self, *_args, theme=None) -> None:
+        if theme is None:
+            theme = get_theme()
+        if self.icon_active:
+            self._color.rgba = list(theme.icon)
+        else:
+            hidden = list(theme.text_muted)
+            hidden[3] = 0.9
+            self._color.rgba = hidden
 
     def _sync_source(self, *_args) -> None:
         self._icon.source = self.icon_source
@@ -95,10 +109,12 @@ class CarveSpinner(Widget):
 
     angle = NumericProperty(0.0)
     spinning = BooleanProperty(False)
-    line_rgba = ListProperty([0.35, 0.82, 0.92, 0.95])
+    line_rgba = ListProperty(list(DARK["active_color"]))
 
     def __init__(self, **kwargs):
         kwargs.setdefault("size_hint", (None, None))
+        if "line_rgba" not in kwargs:
+            kwargs["line_rgba"] = list(get_theme().active_color)
         super().__init__(**kwargs)
         with self.canvas:
             self._color = Color(*self.line_rgba)
@@ -116,6 +132,10 @@ class CarveSpinner(Widget):
         )
         self._layout()
         self.opacity = 1.0 if self.spinning else 0.0
+        self._stop_theme = watch_theme(self._apply_theme_spinner)
+
+    def _apply_theme_spinner(self, theme) -> None:
+        self.line_rgba = list(theme.active_color)
 
     def _apply_color(self, *_args) -> None:
         self._color.rgba = self.line_rgba
@@ -148,13 +168,67 @@ class CarveSpinner(Widget):
         anim.start(self)
 
 
+class SimViewMenuButton(ButtonBehavior, BoxLayout):
+    """One exclusive row in the simulation view menu."""
+
+    icon = StringProperty("")
+    active = BooleanProperty(False)
+    text = StringProperty("")
+
+
+class SimViewDropDown(ToolTipDropDown):
+    """Paths, stock shell, or carved simulation."""
+
+    view_mode = StringProperty(SIM_VIEW_SIMULATION)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._buttons: dict[str, SimViewMenuButton] = {}
+        for mode, icon, label in (
+            (SIM_VIEW_PATHS, "data/tool.png", tr._("Paths only")),
+            (SIM_VIEW_STOCK, "data/GcodeViewer/stock.png", tr._("Stock")),
+            (SIM_VIEW_SIMULATION, "data/eye.png", tr._("Simulation")),
+        ):
+            button = SimViewMenuButton(icon=icon, text=label)
+            button.bind(on_release=lambda _btn, mode=mode: self._choose(mode))
+            self.add_widget(button)
+            self._buttons[mode] = button
+        self.bind(view_mode=self._sync_active)
+        self._sync_active()
+
+    def _sync_active(self, *_args) -> None:
+        mode = str(self.view_mode or SIM_VIEW_SIMULATION)
+        for item_mode, button in self._buttons.items():
+            button.active = item_mode == mode
+
+    def _choose(self, mode: str) -> None:
+        self.dismiss()
+        app = App.get_running_app()
+        root = getattr(app, "root", None) if app is not None else None
+        viewer = getattr(root, "gcode_viewer", None)
+        if viewer is not None:
+            viewer.set_sim_view(mode)
+
+
 class SimStatsHud(BoxLayout):
-    """Simulation title, carving spinner, stock cog, mesh eye, and stats."""
+    """Simulation title, carving spinner, stock cog, view menu, and stats."""
 
     stats_text = StringProperty("")
     carving = BooleanProperty(False)
-    mesh_visible = BooleanProperty(True)
+    view_mode = StringProperty(SIM_VIEW_SIMULATION)
     hud_visible = BooleanProperty(False)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._view_dropdown = SimViewDropDown(view_mode=self.view_mode)
+        self.bind(view_mode=self._on_view_mode)
+
+    def _on_view_mode(self, _instance, mode: str) -> None:
+        self._view_dropdown.view_mode = str(mode or SIM_VIEW_SIMULATION)
+
+    def open_view_menu(self, anchor) -> None:
+        self._view_dropdown.view_mode = self.view_mode
+        self._view_dropdown.open(anchor)
 
     def _is_hidden(self) -> bool:
         return (not self.hud_visible) or self.opacity <= 0

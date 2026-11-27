@@ -3,15 +3,15 @@
         do_scroll_x: False
         size_hint: 1,1
         bar_width: 4
-        bar_inactive_color: [.7,.7,.7,.9]
+        bar_inactive_color: app.theme.scroll_bar_inactive
         GridLayout:
             cols: 2
             size_hint_y: None
             height: self.minimum_height
-            spacing:dp(2)
-            row_default_height: dp(28)
+            spacing: dp(6), dp(8)
+            row_default_height: dp(32)
             row_force_default: True
-            padding:dp(1)
+            padding: dp(4)
             halign:'right'
             valign:'top'
 
@@ -23,7 +23,6 @@
                     size_hint_x: 0.4
                     font_size: '14dp'
                     hint_text: tr._("config")
-					hint_text_color: (0.2,0.5,0.5,0.5)
                     tooltip_txt: tr._('How far to move along the X axis before probing toward pin when calibrating 4th axis Z offset')
                     tooltip_image: ''
                     multiline: False
@@ -41,7 +40,6 @@
                     size_hint_x: 0.4
                     font_size: '14dp'
                     hint_text: tr._("config")
-					hint_text_color: (0.2,0.5,0.5,0.5)
                     tooltip_txt: tr._('Not needed by default. \nUse to change how far to each side the machine probes when calibrating X offset')
                     tooltip_image: ''
                     multiline: False
@@ -59,7 +57,6 @@
                     size_hint_x: 0.4
                     font_size: '14dp'
                     hint_text: tr._("config")
-					hint_text_color: (0.2,0.5,0.5,0.5)
                     tooltip_txt: tr._('Effective Diameter of Probe Tip. Measure with M460')
                     tooltip_image: 'addons/probing/data/icons_1024x768/general_parameters/probe_parameter_d.png'
                     tooltip_image_size: 200,200
@@ -72,16 +69,14 @@
 
             BoxLayout:
                 ProbeSettingLabel:
-                    label_text: 'Y Clearance (C):'
+                    label_text: 'Clearance (C):'
                 ToolTipTextInput:
                     id: ClearanceY
                     size_hint_x: 0.4
                     font_size: '14dp'
                     hint_text: tr._("0")
-					hint_text_color: (0.2,0.5,0.5,0.5)
-                    tooltip_txt: tr._('When Probing A Axis Height, how far along Y to move after probing headstock before moving along X toward the pin. Use to avoid large chucks')
+                    tooltip_txt: tr._('In M469.6: Radial clearance between artifact and probe tip during arc movements \nIn M469.5: Z lift between consecutive probes')
                     tooltip_image: ''
-                    tooltip_image_size: 200,200
                     multiline: False
                     halign:'right'
                     input_type: 'number'
@@ -97,7 +92,6 @@
                     size_hint_x: 0.4
                     font_size: '14dp'
                     hint_text: tr._("config")
-					hint_text_color: (0.2,0.5,0.5,0.5)
                     tooltip_txt: tr._('Not needed by default. \nUsed in calibrating 4th axis X offset, see tooltip image')
                     tooltip_image: ''
                     multiline: False
@@ -106,24 +100,6 @@
                     input_filter: 'float'
                     text: root.get_setting('PocketProbeDepth')
                     on_text: root.setting_changed('PocketProbeDepth', self.text)
-            
-            BoxLayout:
-                ProbeSettingLabel:
-                    label_text: '4th axis Y Depth (E):'
-                ToolTipTextInput:
-                    id: PocketProbeDepth
-                    size_hint_x: 0.4
-                    font_size: '14dp'
-                    hint_text: tr._("config")
-					hint_text_color: (0.2,0.5,0.5,0.5)
-                    tooltip_txt: tr._('Not needed by default. \nUsed in calibrating 4th axis Y offset, see tooltip image')
-                    tooltip_image: ''
-                    multiline: False
-                    halign:'right'
-                    input_type: 'number'
-                    input_filter: 'float'
-                    text: root.get_setting('SideProbeDepth')
-                    on_text: root.setting_changed('SideProbeDepth', self.text)
 
             BoxLayout:
                 ProbeSettingLabel:
@@ -133,7 +109,6 @@
                     size_hint_x: 0.4
                     font_size: '14dp'
                     hint_text: tr._("required")
-					hint_text_color: (0.2,0.5,0.5,0.5)
                     tooltip_txt: tr._('Diameter of pin used for 4th axis Z calibration')
                     tooltip_image: ''
                     multiline: False
@@ -154,12 +129,6 @@
                     size_hint_x: 0.4
                     font_size: '14dp'
                     tooltip_txt: tr._('Wip')
-                    canvas.before:
-                        Color:
-                            rgba: 50/255, 50/255, 50/255, 1
-                        Rectangle:
-                            pos: self.pos
-                            size: self.size
                     active: root.get_setting('ZeroXYPosition') == "1"
                     on_active: root.setting_changed('ZeroXYPosition', "1" if self.active else "0")
 
@@ -172,12 +141,6 @@
                     size_hint_x: 0.4
                     font_size: '14dp'
                     tooltip_txt: tr._('Enable this switch if you have a normally closed probe instead of a normally open one')
-                    canvas.before:
-                        Color:
-                            rgba: 50/255, 50/255, 50/255, 1
-                        Rectangle:
-                            pos: self.pos
-                            size: self.size
                     active: root.get_setting('UseProbeNormallyClosed') == "1"
                     on_active: root.setting_changed('UseProbeNormallyClosed', "1" if self.active else "0")
             BoxLayout:

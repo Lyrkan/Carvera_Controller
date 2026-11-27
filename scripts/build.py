@@ -41,6 +41,14 @@ PACKAGE_PATH = PROJECT_PATH.resolve()
 ROOT_ASSETS_PATH = ROOT_PATH.joinpath(ASSETS_FOLDER).resolve()
 
 
+def _pyinstaller_source_dest(source, dest: str) -> str:
+    """``source`` and ``dest`` joined for PyInstaller's ``--add-data`` and ``--add-binary``.
+
+    PyInstaller splits the pair on ``os.pathsep``, which is ``;`` on Windows.
+    """
+    return f"{source}{os.pathsep}{dest}"
+
+
 def build_pyinstaller_args(
     os: str,
     output_filename: str,
@@ -67,7 +75,9 @@ def build_pyinstaller_args(
         build_args += ["--icon", f"{ROOT_ASSETS_PATH.joinpath('icon-src.icns')}"]
         build_args += [
             "--add-binary",
-            f"{ROOT_ASSETS_PATH.joinpath('hidapi/macos/' + platform.machine() + '/libhidapi.dylib')}:.",
+            _pyinstaller_source_dest(
+                ROOT_ASSETS_PATH.joinpath("hidapi/macos/" + platform.machine() + "/libhidapi.dylib"), "."
+            ),
         ]
     if os == "windows":
         logger.info("Build option: onefile")
@@ -75,7 +85,10 @@ def build_pyinstaller_args(
         logger.info(f"Output file icon: {ROOT_ASSETS_PATH.joinpath('icon-src.ico')}")
         build_args += ["--icon", f"{ROOT_ASSETS_PATH.joinpath('icon-src.ico')}"]
         logger.info(f"Add hidapi.dll binary: {ROOT_ASSETS_PATH.joinpath('hidapi/windows/hidapi.dll')}")
-        build_args += ["--add-binary", f"{ROOT_ASSETS_PATH.joinpath('hidapi/windows/hidapi.dll')}:."]
+        build_args += [
+            "--add-binary",
+            _pyinstaller_source_dest(ROOT_ASSETS_PATH.joinpath("hidapi/windows/hidapi.dll"), "."),
+        ]
         logger.info("Add win32timezone to hidden imports")
         build_args += ["--hiddenimport", "win32timezone"]
     else:
@@ -94,8 +107,16 @@ def build_pyinstaller_args(
         "carveracontroller.addons.stock.simulator.native.lib._stock_carve",
     ]
 
+    # Registered at import from kivy_matplotlib_widget/fonts/NavigationIcons.ttf.
+    # The path is built from __file__, so PyInstaller does not pick the file up.
+    logger.info("Collect kivy_matplotlib_widget data files (NavigationIcons.ttf)")
+    build_args += ["--collect-data", "kivy_matplotlib_widget"]
+
     logger.info(f"Add bundled package assets: {PACKAGE_PATH}")
-    build_args += ["--add-data", f"{PACKAGE_PATH}:carveracontroller"]
+    build_args += ["--add-data", _pyinstaller_source_dest(PACKAGE_PATH, "carveracontroller")]
+    fonts_path = ROOT_PATH / "assets" / "fonts"
+    logger.info(f"Add bundled fonts: {fonts_path}")
+    build_args += ["--add-data", _pyinstaller_source_dest(fonts_path, "assets/fonts")]
 
     logger.info("Build options: noconsole, noconfirm, noupx, clean")
     build_args += [
