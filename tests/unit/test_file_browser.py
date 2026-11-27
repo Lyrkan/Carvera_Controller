@@ -1541,3 +1541,89 @@ def test_cache_size_apply_shows_clamped_value(monkeypatch):
 
     assert widget.value == "10000"
     cache.set_max_images.assert_called_once_with(10000)
+
+
+def test_machine_file_editor_popup_follows_theme_and_unbinds_on_dismiss():
+    from pathlib import Path
+
+    import pytest
+    from kivy.app import App
+    from kivy.base import EventLoop
+    from kivy.lang import Builder
+    from kivy.properties import BooleanProperty, NumericProperty, ObjectProperty
+    from kivy.uix.widget import Widget
+
+    from carveracontroller.ui.file_browser.MachineFileEditorPopup import MachineFileEditorPopup
+    from carveracontroller.ui.theme import Theme
+
+    pkg_root = Path(__file__).resolve().parents[2] / "carveracontroller"
+
+    class _EditorTestApp(App):
+        show_tooltips = BooleanProperty(False)
+        tooltip_delay = NumericProperty(0)
+        theme = ObjectProperty(None, allownone=True, rebind=True)
+
+        def load_kv(self, filename=None):
+            return False
+
+        def build(self):
+            return Widget()
+
+    app = App.get_running_app() or _EditorTestApp()
+    for name, prop, val in (
+        ("show_tooltips", BooleanProperty(False), False),
+        ("tooltip_delay", NumericProperty(0), 0),
+        ("theme", ObjectProperty(None, allownone=True, rebind=True), Theme()),
+    ):
+        if not hasattr(app, name):
+            app.apply_property(**{name: prop})
+            setattr(app, name, val)
+    original_theme = app.theme
+    theme = Theme()
+    app.theme = theme
+    try:
+        for rel_kv in (
+            "ui/theme.kv",
+            "addons/tooltips/Tooltips.kv",
+            "ui/common/action_button.kv",
+            "ui/file_browser/MachineFileEditorPopup.kv",
+        ):
+            kv_path = str(pkg_root / rel_kv)
+            if kv_path not in Builder.files:
+                Builder.load_file(kv_path)
+        EventLoop.ensure_window()
+
+        popup = MachineFileEditorPopup()
+        assert list(popup.background_color) == pytest.approx(list(theme.surface))
+        assert list(popup.ids.content_scroll.bar_color) == pytest.approx(list(theme.scroll_bar))
+        assert list(popup.ids.content_scroll.bar_inactive_color) == pytest.approx(list(theme.scroll_bar_inactive))
+        assert popup.ids.ti_content.font_name == theme.font_code_list
+        assert popup.ids.btn_save.role == "primary"
+        assert popup.ids.btn_cancel.role == "normal"
+
+        theme.apply_palette("light")
+        assert list(popup.background_color) == pytest.approx(list(theme.surface))
+        assert list(popup.ids.content_scroll.bar_inactive_color) == pytest.approx(list(theme.scroll_bar_inactive))
+
+        popup.ids.content_scroll.scroll_y = 0.25
+        popup.open_editor("part.nc", "G0 X0 Y0\nG1 X10 F500\n")
+        assert popup.ids.ti_filename.text == "part.nc"
+        assert popup.ids.ti_content.text == "G0 X0 Y0\nG1 X10 F500\n"
+        assert popup.ids.content_scroll.scroll_y == 1
+
+        saved = []
+        fake_root = SimpleNamespace(save_machine_file_editor=lambda name, text: saved.append((name, text)))
+        original_root = getattr(app, "root", None)
+        app.root = fake_root
+        try:
+            popup.ids.ti_filename.text = "renamed.nc"
+            popup.ids.ti_content.text = "G0 X5\n"
+            popup.save()
+        finally:
+            app.root = original_root
+            popup.dismiss()
+
+        assert saved == [("renamed.nc", "G0 X5\n")]
+    finally:
+        app.theme = original_theme or Theme()
+

@@ -1,59 +1,106 @@
 #:import tr carveracontroller.__main__.tr
-#:import dp kivy.metrics.dp
+#:import _ carveracontroller.ui.common
+#:import _ carveracontroller.ui.file_browser.MachineFileEditorPopup
 
 <MachineFileEditorPopup>:
-    size_hint: 0.85, 0.85
+    size_hint: 0.82, 0.85
     pos_hint: {"center_x": 0.5, "center_y": 0.5}
     auto_dismiss: False
     BoxLayout:
         orientation: "vertical"
-        padding: "15dp"
-        spacing: "8dp"
-        Label:
-            text: tr._("Edit file on machine")
-            size_hint_y: None
-            height: "32dp"
-            bold: True
-            halign: "center"
-            valign: "middle"
-            text_size: self.size
+        padding: dp(12), dp(12), dp(12), dp(16)
+        spacing: dp(8)
         BoxLayout:
             size_hint_y: None
-            height: "35dp"
-            spacing: "8dp"
+            height: dp(36)
+            spacing: dp(8)
+            Image:
+                source: "data/file-code-outline.png"
+                color: app.theme.icon
+                size_hint: None, None
+                size: dp(22), dp(22)
+                pos_hint: {"center_y": 0.5}
+                fit_mode: "contain"
+            Label:
+                text: tr._("Edit file on machine")
+                bold: True
+                font_size: dp(18)
+                halign: "left"
+                valign: "middle"
+                text_size: self.size
+        BoxLayout:
+            size_hint_y: None
+            height: dp(36)
+            spacing: dp(8)
             Label:
                 text: tr._("Filename")
                 size_hint_x: None
-                width: "90dp"
-                halign: "right"
+                width: max(dp(80), self.texture_size[0] + dp(8))
+                color: app.theme.text_secondary
+                font_size: dp(14)
+                halign: "left"
                 valign: "middle"
-                text_size: self.size
+                text_size: None, self.height
             TextInput:
                 id: ti_filename
                 multiline: False
-                write_tab: False
-        ScrollView:
-            id: content_scroll
+                padding: [dp(10), max(dp(4), (self.height - self.line_height) / 2)]
+                selection_color: app.theme.selection_fill(0.45, app.theme.revision)
+        BoxLayout:
             size_hint_y: 1
-            do_scroll_x: False
-            scroll_type: ["bars", "content"]
-            bar_width: dp(12)
-            bar_color: 0.55, 0.55, 0.55, 0.9
-            bar_inactive_color: 0.35, 0.35, 0.35, 0.5
-            TextInput:
-                id: ti_content
-                size_hint_y: None
-                height: dp(200)
-                multiline: True
-                write_tab: False
-                padding: [dp(8), dp(8), dp(8), dp(8)]
+            padding: dp(2)
+            canvas.before:
+                Color:
+                    rgba: app.theme.field_bg
+                RoundedRectangle:
+                    pos: self.pos
+                    size: self.size
+                    radius: [dp(app.theme.radius_m)]
+            canvas.after:
+                Color:
+                    rgba: app.theme.accent if root.content_focused else app.theme.border
+                Line:
+                    width: dp(1)
+                    rounded_rectangle: (self.x + dp(0.5), self.y + dp(0.5), max(0, self.width - dp(1)), max(0, self.height - dp(1)), max(0, dp(app.theme.radius_m) - dp(0.5)))
+            ScrollView:
+                id: content_scroll
+                size_hint_y: 1
+                do_scroll_x: False
+                scroll_type: ["bars", "content"]
+                scroll_wheel_distance: dp(60)
+                bar_width: dp(10)
+                bar_color: app.theme.scroll_bar
+                bar_inactive_color: app.theme.scroll_bar_inactive
+                TextInput:
+                    id: ti_content
+                    size_hint_y: None
+                    height: dp(200)
+                    multiline: True
+                    font_name: app.theme.font_code_list
+                    background_color: 0, 0, 0, 0
+                    show_field_edge: False
+                    selection_color: app.theme.selection_fill(0.45, app.theme.revision)
+                    padding: [dp(10), dp(8), dp(16), dp(8)]
+                    on_focus: root.content_focused = self.focus
         BoxLayout:
             size_hint_y: None
-            height: "40dp"
-            spacing: "8dp"
-            Button:
-                text: tr._("Cancel")
+            height: dp(40)
+            spacing: dp(app.theme.spacing)
+            Widget:
+            PopupActionButton:
+                id: btn_cancel
+                size_hint_y: None
+                height: dp(40)
+                icon: "data/close.png"
+                btn_text: tr._("Cancel")
+                flat: True
                 on_release: root.cancel()
-            Button:
-                text: tr._("Save")
+            PopupActionButton:
+                id: btn_save
+                size_hint_y: None
+                height: dp(40)
+                icon: "data/floppy.png"
+                btn_text: tr._("Save")
+                flat: True
+                primary: True
                 on_release: root.save()
